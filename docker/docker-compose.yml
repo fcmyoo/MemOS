@@ -1,24 +1,53 @@
 name: memos-dev
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: memos-postgres
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      POSTGRES_USER: memos
+      POSTGRES_PASSWORD: 
+      POSTGRES_DB: memos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d
+    networks:
+      - memos_network
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U memos]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   memos:
     container_name: memos-api-docker
     build:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "8000:8000"
+      - 8000:8000
     env_file:
       - ../.env
     depends_on:
       - neo4j
       - qdrant
+      - postgres
     environment:
       - PYTHONPATH=/app/src
       - HF_ENDPOINT=https://hf-mirror.com
       - QDRANT_HOST=qdrant-docker
       - QDRANT_PORT=6333
       - NEO4J_URI=bolt://neo4j-docker:7687
+      - POSTGRES_HOST=memos-postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=memos
+      - POSTGRES_PASSWORD=
+      - POSTGRES_DB=memos
+      - AUTH_ENABLED=false
+      - MASTER_KEY_HASH=
     volumes:
       - ../src:/app/src
       - .:/app/docker
@@ -29,8 +58,8 @@ services:
     image: neo4j:5.26.4
     container_name: neo4j-docker
     ports:
-      - "7474:7474"   # HTTP
-      - "7687:7687"   # Bolt
+      - 7474:7474   # HTTP
+      - 7687:7687   # Bolt
     healthcheck:
       test: wget http://localhost:7474 || exit 1
       interval: 1s
@@ -38,8 +67,8 @@ services:
       retries: 20
       start_period: 3s
     environment:
-      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
-      NEO4J_AUTH: "neo4j/12345678"
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: yes
+      NEO4J_AUTH: neo4j/12345678
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -50,8 +79,8 @@ services:
     image: qdrant/qdrant:v1.15.3
     container_name: qdrant-docker
     ports:
-      - "6333:6333"  # REST API
-      - "6334:6334"  # gRPC API
+      - 6333:6333  # REST API
+      - 6334:6334  # gRPC API
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
@@ -65,6 +94,7 @@ volumes:
   neo4j_data:
   neo4j_logs:
   qdrant_data:
+  postgres_data:
 
 networks:
   memos_network:
