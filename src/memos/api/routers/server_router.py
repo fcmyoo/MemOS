@@ -15,7 +15,7 @@ import os
 import random as _random
 import socket
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from memos.api import handlers
 from memos.api.handlers.add_handler import AddHandler
@@ -23,6 +23,7 @@ from memos.api.handlers.base_handler import HandlerDependencies
 from memos.api.handlers.chat_handler import ChatHandler
 from memos.api.handlers.feedback_handler import FeedbackHandler
 from memos.api.handlers.search_handler import SearchHandler
+from memos.api.middleware.auth import require_scope, verify_api_key
 from memos.api.product_models import (
     AllStatusResponse,
     APIADDRequest,
@@ -102,7 +103,12 @@ vector_db = components["vector_db"]
 # =============================================================================
 
 
-@router.post("/search", summary="Search memories", response_model=SearchResponse)
+@router.post(
+    "/search",
+    summary="Search memories",
+    response_model=SearchResponse,
+    dependencies=[Depends(require_scope("read"))],
+)
 def search_memories(search_req: APISearchRequest):
     """
     Search memories for a specific user.
@@ -118,7 +124,12 @@ def search_memories(search_req: APISearchRequest):
 # =============================================================================
 
 
-@router.post("/add", summary="Add memories", response_model=MemoryResponse)
+@router.post(
+    "/add",
+    summary="Add memories",
+    response_model=MemoryResponse,
+    dependencies=[Depends(require_scope("write"))],
+)
 def add_memories(add_req: APIADDRequest):
     """
     Add memories for a specific user.
@@ -137,6 +148,7 @@ def add_memories(add_req: APIADDRequest):
     "/scheduler/allstatus",
     summary="Get detailed scheduler status",
     response_model=AllStatusResponse,
+    dependencies=[Depends(require_scope("read"))],
 )
 def scheduler_allstatus():
     """Get detailed scheduler status including running tasks and queue metrics."""
@@ -146,7 +158,10 @@ def scheduler_allstatus():
 
 
 @router.get(  # Changed from post to get
-    "/scheduler/status", summary="Get scheduler running status", response_model=StatusResponse
+    "/scheduler/status",
+    summary="Get scheduler running status",
+    response_model=StatusResponse,
+    dependencies=[Depends(require_scope("read"))],
 )
 def scheduler_status(
     user_id: str = Query(..., description="User ID"),
@@ -164,6 +179,7 @@ def scheduler_status(
     "/scheduler/task_queue_status",
     summary="Get scheduler task queue status",
     response_model=TaskQueueResponse,
+    dependencies=[Depends(require_scope("read"))],
 )
 def scheduler_task_queue_status(
     user_id: str = Query(..., description="User ID whose queue status is requested"),
@@ -174,7 +190,11 @@ def scheduler_task_queue_status(
     )
 
 
-@router.post("/scheduler/wait", summary="Wait until scheduler is idle for a specific user")
+@router.post(
+    "/scheduler/wait",
+    summary="Wait until scheduler is idle for a specific user",
+    dependencies=[Depends(require_scope("read"))],
+)
 def scheduler_wait(
     user_name: str,
     timeout_seconds: float = 120.0,
@@ -189,7 +209,11 @@ def scheduler_wait(
     )
 
 
-@router.get("/scheduler/wait/stream", summary="Stream scheduler progress for a user")
+@router.get(
+    "/scheduler/wait/stream",
+    summary="Stream scheduler progress for a user",
+    dependencies=[Depends(require_scope("read"))],
+)
 def scheduler_wait_stream(
     user_name: str,
     timeout_seconds: float = 120.0,
@@ -210,7 +234,11 @@ def scheduler_wait_stream(
 # =============================================================================
 
 
-@router.post("/chat/complete", summary="Chat with MemOS (Complete Response)")
+@router.post(
+    "/chat/complete",
+    summary="Chat with MemOS (Complete Response)",
+    dependencies=[Depends(require_scope("read"))],
+)
 def chat_complete(chat_req: APIChatCompleteRequest):
     """
     Chat with MemOS for a specific user. Returns complete response (non-streaming).
@@ -224,7 +252,7 @@ def chat_complete(chat_req: APIChatCompleteRequest):
     return chat_handler.handle_chat_complete(chat_req)
 
 
-@router.post("/chat/stream", summary="Chat with MemOS")
+@router.post("/chat/stream", summary="Chat with MemOS", dependencies=[Depends(require_scope("read"))])
 def chat_stream(chat_req: ChatRequest):
     """
     Chat with MemOS for a specific user. Returns SSE stream.
@@ -239,7 +267,11 @@ def chat_stream(chat_req: ChatRequest):
     return chat_handler.handle_chat_stream(chat_req)
 
 
-@router.post("/chat/stream/playground", summary="Chat with MemOS playground")
+@router.post(
+    "/chat/stream/playground",
+    summary="Chat with MemOS playground",
+    dependencies=[Depends(require_scope("read"))],
+)
 def chat_stream_playground(chat_req: ChatPlaygroundRequest):
     """
     Chat with MemOS for a specific user. Returns SSE stream.
@@ -263,6 +295,7 @@ def chat_stream_playground(chat_req: ChatPlaygroundRequest):
     "/suggestions",
     summary="Get suggestion queries",
     response_model=SuggestionResponse,
+    dependencies=[Depends(require_scope("read"))],
 )
 def get_suggestion_queries(suggestion_req: SuggestionRequest):
     """Get suggestion queries for a specific user with language preference."""
@@ -280,7 +313,12 @@ def get_suggestion_queries(suggestion_req: SuggestionRequest):
 # =============================================================================
 
 
-@router.post("/get_all", summary="Get all memories for user", response_model=MemoryResponse)
+@router.post(
+    "/get_all",
+    summary="Get all memories for user",
+    response_model=MemoryResponse,
+    dependencies=[Depends(require_scope("read"))],
+)
 def get_all_memories(memory_req: GetMemoryPlaygroundRequest):
     """
     Get all memories or subgraph for a specific user.
@@ -310,7 +348,12 @@ def get_all_memories(memory_req: GetMemoryPlaygroundRequest):
         )
 
 
-@router.post("/get_memory", summary="Get memories for user", response_model=GetMemoryResponse)
+@router.post(
+    "/get_memory",
+    summary="Get memories for user",
+    response_model=GetMemoryResponse,
+    dependencies=[Depends(require_scope("read"))],
+)
 def get_memories(memory_req: GetMemoryRequest):
     return handlers.memory_handler.handle_get_memories(
         get_mem_req=memory_req,
@@ -318,7 +361,12 @@ def get_memories(memory_req: GetMemoryRequest):
     )
 
 
-@router.get("/get_memory/{memory_id}", summary="Get memory by id", response_model=GetMemoryResponse)
+@router.get(
+    "/get_memory/{memory_id}",
+    summary="Get memory by id",
+    response_model=GetMemoryResponse,
+    dependencies=[Depends(require_scope("read"))],
+)
 def get_memory_by_id(memory_id: str):
     return handlers.memory_handler.handle_get_memory(
         memory_id=memory_id,
@@ -326,7 +374,12 @@ def get_memory_by_id(memory_id: str):
     )
 
 
-@router.post("/get_memory_by_ids", summary="Get memory by ids", response_model=GetMemoryResponse)
+@router.post(
+    "/get_memory_by_ids",
+    summary="Get memory by ids",
+    response_model=GetMemoryResponse,
+    dependencies=[Depends(require_scope("read"))],
+)
 def get_memory_by_ids(memory_ids: list[str]):
     return handlers.memory_handler.handle_get_memory_by_ids(
         memory_ids=memory_ids,
@@ -335,7 +388,10 @@ def get_memory_by_ids(memory_ids: list[str]):
 
 
 @router.post(
-    "/delete_memory", summary="Delete memories for user", response_model=DeleteMemoryResponse
+    "/delete_memory",
+    summary="Delete memories for user",
+    response_model=DeleteMemoryResponse,
+    dependencies=[Depends(require_scope("write"))],
 )
 def delete_memories(memory_req: DeleteMemoryRequest):
     return handlers.memory_handler.handle_delete_memories(
@@ -348,7 +404,12 @@ def delete_memories(memory_req: DeleteMemoryRequest):
 # =============================================================================
 
 
-@router.post("/feedback", summary="Feedback memories", response_model=MemoryResponse)
+@router.post(
+    "/feedback",
+    summary="Feedback memories",
+    response_model=MemoryResponse,
+    dependencies=[Depends(require_scope("write"))],
+)
 def feedback_memories(feedback_req: APIFeedbackRequest):
     """
     Feedback memories for a specific user.
@@ -367,6 +428,7 @@ def feedback_memories(feedback_req: APIFeedbackRequest):
     "/get_user_names_by_memory_ids",
     summary="Get user names by memory ids",
     response_model=GetUserNamesByMemoryIdsResponse,
+    dependencies=[Depends(verify_api_key)],
 )
 def get_user_names_by_memory_ids(request: GetUserNamesByMemoryIdsRequest):
     """Get user names by memory ids."""
@@ -389,6 +451,7 @@ def get_user_names_by_memory_ids(request: GetUserNamesByMemoryIdsRequest):
     "/exist_mem_cube_id",
     summary="Check if mem cube id exists",
     response_model=ExistMemCubeIdResponse,
+    dependencies=[Depends(verify_api_key)],
 )
 def exist_mem_cube_id(request: ExistMemCubeIdRequest):
     """(inner) Check if mem cube id exists."""
@@ -399,7 +462,11 @@ def exist_mem_cube_id(request: ExistMemCubeIdRequest):
     )
 
 
-@router.post("/chat/stream/business_user", summary="Chat with MemOS for business user")
+@router.post(
+    "/chat/stream/business_user",
+    summary="Chat with MemOS for business user",
+    dependencies=[Depends(verify_api_key)],
+)
 def chat_stream_business_user(chat_req: ChatBusinessRequest):
     """(inner) Chat with MemOS for a specific business user. Returns SSE stream."""
     if chat_handler is None:
@@ -414,6 +481,7 @@ def chat_stream_business_user(chat_req: ChatBusinessRequest):
     "/delete_memory_by_record_id",
     summary="Delete memory by record id",
     response_model=DeleteMemoryByRecordIdResponse,
+    dependencies=[Depends(require_scope("write"))],
 )
 def delete_memory_by_record_id(memory_req: DeleteMemoryByRecordIdRequest):
     """(inner) Delete memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
@@ -434,6 +502,7 @@ def delete_memory_by_record_id(memory_req: DeleteMemoryByRecordIdRequest):
     "/recover_memory_by_record_id",
     summary="Recover memory by record id",
     response_model=RecoverMemoryByRecordIdResponse,
+    dependencies=[Depends(require_scope("write"))],
 )
 def recover_memory_by_record_id(memory_req: RecoverMemoryByRecordIdRequest):
     """(inner) Recover memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
@@ -450,7 +519,10 @@ def recover_memory_by_record_id(memory_req: RecoverMemoryByRecordIdRequest):
 
 
 @router.post(
-    "/get_memory_dashboard", summary="Get memories for dashboard", response_model=GetMemoryResponse
+    "/get_memory_dashboard",
+    summary="Get memories for dashboard",
+    response_model=GetMemoryResponse,
+    dependencies=[Depends(require_scope("read"))],
 )
 def get_memories_dashboard(memory_req: GetMemoryDashboardRequest):
     return handlers.memory_handler.handle_get_memories_dashboard(
