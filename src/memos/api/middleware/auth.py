@@ -6,9 +6,11 @@ Keys are validated against SHA-256 hashes stored in PostgreSQL.
 """
 
 import hashlib
+import json
 import os
 import time
 
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request, Security
@@ -117,9 +119,27 @@ async def lookup_api_key(key_hash: str) -> dict[str, Any] | None:
                 return None
 
             # Check expiration
-            if expires_at and expires_at < time.time():
-                logger.warning(f"Expired API key used: {key_hash[:16]}...")
-                return None
+            if expires_at:
+                if isinstance(expires_at, datetime):
+                    expires_at_dt = (
+                        expires_at
+                        if expires_at.tzinfo is not None
+                        else expires_at.replace(tzinfo=timezone.utc)
+                    )
+                    if expires_at_dt < datetime.now(timezone.utc):
+                        logger.warning(f"Expired API key used: {key_hash[:16]}...")
+                        return None
+                elif isinstance(expires_at, (int, float)) and expires_at < time.time():
+                    logger.warning(f"Expired API key used: {key_hash[:16]}...")
+                    return None
+
+            resolved_scopes = scopes or ["read"]
+            if isinstance(resolved_scopes, str):
+                try:
+                    parsed_scopes = json.loads(resolved_scopes)
+                    resolved_scopes = parsed_scopes if isinstance(parsed_scopes, list) else [parsed_scopes]
+                except json.JSONDecodeError:
+                    resolved_scopes = [resolved_scopes]
 
             # Update last_used_at
             cur.execute(
@@ -131,7 +151,7 @@ async def lookup_api_key(key_hash: str) -> dict[str, Any] | None:
             return {
                 "id": str(key_id),
                 "user_name": user_name,
-                "scopes": scopes or ["read"],
+                "scopes": resolved_scopes,
             }
     except Exception as e:
         logger.error(f"Database error during key lookup: {e}")

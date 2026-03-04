@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.staticfiles import StaticFiles
 
 from memos.api.exceptions import APIExceptionHandler
+from memos.api.middleware.auth import AUTH_ENABLED
 from memos.api.middleware.request_context import RequestContextMiddleware
 from memos.api.routers.admin_router import router as admin_router
 from memos.api.routers.server_router import router as server_router
@@ -18,10 +19,15 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+DOCS_PUBLIC = os.getenv("DOCS_PUBLIC", "true").lower() == "true"
+
 app = FastAPI(
     title="MemOS Server REST APIs",
     description="A REST API for managing multiple users with MemOS Server.",
     version="1.0.1",
+    docs_url="/docs" if DOCS_PUBLIC else None,
+    redoc_url="/redoc" if DOCS_PUBLIC else None,
+    openapi_url="/openapi.json" if DOCS_PUBLIC else None,
 )
 
 app.mount("/download", StaticFiles(directory=os.getenv("FILE_LOCAL_PATH")), name="static_mapping")
@@ -30,6 +36,12 @@ app.add_middleware(RequestContextMiddleware, source="server_api")
 # Include routers
 app.include_router(server_router)
 app.include_router(admin_router)
+
+
+@app.get("/health", tags=["Health"])
+def health_check():
+    return {"status": "ok", "version": "1.0.1", "auth_enabled": AUTH_ENABLED}
+
 
 # Request validation failed
 app.exception_handler(RequestValidationError)(APIExceptionHandler.validation_error_handler)

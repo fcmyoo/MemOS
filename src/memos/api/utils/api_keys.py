@@ -8,7 +8,9 @@ import hashlib
 import secrets
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+from psycopg2.extras import Json
 
 
 @dataclass
@@ -107,7 +109,7 @@ def create_api_key_in_db(
 
     expires_at = None
     if expires_in_days:
-        expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
+        expires_at = datetime.now(timezone.utc) + timedelta(days=expires_in_days)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -120,7 +122,7 @@ def create_api_key_in_db(
                 api_key.key_hash,
                 api_key.key_prefix,
                 user_name,
-                scopes or ["read"],
+                Json(scopes or ["read"]),
                 description,
                 expires_at,
                 created_by,
