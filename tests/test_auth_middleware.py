@@ -131,10 +131,44 @@ async def test_scope_all_grants_everything():
 
 @pytest.mark.asyncio
 async def test_internal_request_bypass(monkeypatch: pytest.MonkeyPatch):
-    """Internal request source should bypass API key requirement."""
+    """Internal IP should only bypass when ALLOW_INTERNAL_IP_BYPASS is enabled."""
     monkeypatch.setattr(auth, "AUTH_ENABLED", True)
     monkeypatch.setattr(auth, "MASTER_KEY_HASH", None)
+    monkeypatch.setattr(auth, "ALLOW_INTERNAL_IP_BYPASS", True)
     request = Mock(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+
+    result = await auth.verify_api_key(request=request, api_key=None)
+
+    assert result["is_internal"] is True
+    assert result["scopes"] == ["all"]
+
+
+@pytest.mark.asyncio
+async def test_missing_internal_secret_does_not_bypass(monkeypatch: pytest.MonkeyPatch):
+    """Missing INTERNAL_SERVICE_SECRET must not turn anonymous requests into internal requests."""
+    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
+    monkeypatch.setattr(auth, "MASTER_KEY_HASH", None)
+    monkeypatch.setattr(auth, "ALLOW_INTERNAL_IP_BYPASS", False)
+    monkeypatch.delenv("INTERNAL_SERVICE_SECRET", raising=False)
+    request = Mock(headers={}, client=SimpleNamespace(host="8.8.8.8"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await auth.verify_api_key(request=request, api_key=None)
+
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_internal_secret_header_bypasses(monkeypatch: pytest.MonkeyPatch):
+    """Configured internal secret with matching header should bypass API key checks."""
+    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
+    monkeypatch.setattr(auth, "MASTER_KEY_HASH", None)
+    monkeypatch.setattr(auth, "ALLOW_INTERNAL_IP_BYPASS", False)
+    monkeypatch.setenv("INTERNAL_SERVICE_SECRET", "test-secret")
+    request = Mock(
+        headers={"X-Internal-Service": "test-secret"},
+        client=SimpleNamespace(host="8.8.8.8"),
+    )
 
     result = await auth.verify_api_key(request=request, api_key=None)
 

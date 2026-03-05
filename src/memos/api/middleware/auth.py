@@ -28,6 +28,7 @@ API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
 MASTER_KEY_HASH = os.getenv("MASTER_KEY_HASH")  # SHA-256 hash of master key
 INTERNAL_SERVICE_IPS = {"127.0.0.1", "::1", "memos-mcp", "moltbot", "clawdbot"}
+ALLOW_INTERNAL_IP_BYPASS = os.getenv("ALLOW_INTERNAL_IP_BYPASS", "false").lower() == "true"
 
 # Connection pool for auth queries (lazy init)
 _auth_pool = None
@@ -163,15 +164,20 @@ async def lookup_api_key(key_hash: str) -> dict[str, Any] | None:
 
 def is_internal_request(request: Request) -> bool:
     """Check if request is from internal service."""
-    client_host = request.client.host if request.client else None
-
-    # Check internal IPs
-    if client_host in INTERNAL_SERVICE_IPS:
+    # Check internal header (for container-to-container).
+    # Important: secret must be configured, otherwise missing header must never pass.
+    internal_header = request.headers.get("X-Internal-Service")
+    internal_secret = os.getenv("INTERNAL_SERVICE_SECRET")
+    if internal_secret and internal_header == internal_secret:
         return True
 
-    # Check internal header (for container-to-container)
-    internal_header = request.headers.get("X-Internal-Service")
-    return internal_header == os.getenv("INTERNAL_SERVICE_SECRET")
+    # Optional bypass for trusted internal addresses; disabled by default.
+    if ALLOW_INTERNAL_IP_BYPASS:
+        client_host = request.client.host if request.client else None
+        if client_host in INTERNAL_SERVICE_IPS:
+            return True
+
+    return False
 
 
 async def verify_api_key(
