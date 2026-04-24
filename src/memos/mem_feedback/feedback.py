@@ -33,10 +33,11 @@ from memos.memories.textual.tree_text_memory.organize.manager import (
     extract_working_binding_ids,
 )
 from memos.memories.textual.tree_text_memory.retrieve.retrieve_utils import StopwordManager
+from memos.plugins.hook_defs import H
+from memos.plugins.hooks import trigger_single_hook
 
 
 if TYPE_CHECKING:
-    from memos.memories.textual.simple_preference import SimplePreferenceTextMemory
     from memos.memories.textual.tree_text_memory.retrieve.searcher import Searcher
 from memos.templates.mem_feedback_prompts import (
     FEEDBACK_ANSWER_PROMPT,
@@ -95,7 +96,6 @@ class MemFeedback(BaseMemFeedback):
         self.stopword_manager = StopwordManager
         self.searcher: Searcher = None
         self.reranker = None
-        self.pref_mem: SimplePreferenceTextMemory = None
         self.pref_feedback: bool = False
         self.DB_IDX_READY = False
 
@@ -239,11 +239,15 @@ class MemFeedback(BaseMemFeedback):
         else:
             to_add_memory = new_memory_item.model_copy(deep=True)
 
+        to_add_memory.id = str(uuid.uuid4())
+        if to_add_memory.metadata.memory_type == "PreferenceMemory":
+            to_add_memory.metadata.preference = new_memory_item.memory
+
         to_add_memory.metadata.created_at = to_add_memory.metadata.updated_at = (
             datetime.now().isoformat()
         )
         to_add_memory.metadata.background = new_memory_item.metadata.background
-        to_add_memory.metadata.sources = []
+        to_add_memory.metadata.sources = new_memory_item.metadata.sources
 
         added_ids = self._retry_db_operation(
             lambda: self.memory_manager.add([to_add_memory], user_name=user_name, use_batch=False)
@@ -274,13 +278,6 @@ class MemFeedback(BaseMemFeedback):
         """
         Individual update operations
         """
-        if "preference" in old_memory_item.metadata.__dict__:
-            logger.info(
-                f"[0107 Feedback Core: _single_update_operation] pref_memory: {old_memory_item.id}"
-            )
-            return self._single_update_pref(
-                old_memory_item, new_memory_item, user_id, user_name, operation
-            )
 
         memory_type = old_memory_item.metadata.memory_type
         source_doc_id = (
@@ -294,32 +291,42 @@ class MemFeedback(BaseMemFeedback):
             new_memory_item.memory = operation["text"]
             new_memory_item.metadata.embedding = self._batch_embed([operation["text"]])[0]
 
-        if memory_type == "WorkingMemory":
-            fields = {
-                "memory": new_memory_item.memory,
-                "key": new_memory_item.metadata.key,
-                "tags": new_memory_item.metadata.tags,
-                "embedding": new_memory_item.metadata.embedding,
-                "background": new_memory_item.metadata.background,
-                "covered_history": old_memory_item.id,
-            }
-            self.graph_store.update_node(old_memory_item.id, fields=fields, user_name=user_name)
-            item_id = old_memory_item.id
-        else:
-            done = self._single_add_operation(
-                old_memory_item, new_memory_item, user_id, user_name, async_mode
-            )
-            item_id = done.get("id")
-            self.graph_store.update_node(
-                item_id, {"covered_history": old_memory_item.id}, user_name=user_name
-            )
-            self.graph_store.update_node(
-                old_memory_item.id, {"status": "archived"}, user_name=user_name
-            )
+        if getattr(self.mem_reader, "memory_version_switch", "off") != "on":
+            if memory_type == "WorkingMemory":
+                fields = {
+                    "memory": new_memory_item.memory,
+                    "key": new_memory_item.metadata.key,
+                    "tags": new_memory_item.metadata.tags,
+                    "embedding": new_memory_item.metadata.embedding,
+                    "background": new_memory_item.metadata.background,
+                    "covered_history": old_memory_item.id,
+                }
+                self.graph_store.update_node(old_memory_item.id, fields=fields, user_name=user_name)
+                item_id = old_memory_item.id
+            else:
+                done = self._single_add_operation(
+                    old_memory_item, new_memory_item, user_id, user_name, async_mode
+                )
+                item_id = done.get("id")
+                self.graph_store.update_node(
+                    item_id, {"covered_history": old_memory_item.id}, user_name=user_name
+                )
+                self.graph_store.update_node(
+                    old_memory_item.id, {"status": "archived"}, user_name=user_name
+                )
 
-        logger.info(
-            f"[Memory Feedback UPDATE] New Add:{item_id} | Set archived:{old_memory_item.id} | memory_type: {memory_type}"
-        )
+            logger.info(
+                f"[Memory Feedback UPDATE] New Add:{item_id} | Set archived:{old_memory_item.id} | memory_type: {memory_type}"
+            )
+        else:
+            item_id = self._single_update_operation_with_versions(
+                old_memory_item=old_memory_item,
+                new_memory_item=new_memory_item,
+                user_name=user_name,
+            )
+            logger.info(
+                f"[Memory Feedback UPDATE] Updated:{item_id} | history appended | memory_type: {old_memory_item.metadata.memory_type}"
+            )
 
         return {
             "id": item_id,
@@ -329,67 +336,77 @@ class MemFeedback(BaseMemFeedback):
             "origin_memory": old_memory_item.memory,
         }
 
-    def _single_update_pref(
+    def _single_update_operation_with_versions(
         self,
         old_memory_item: TextualMemoryItem,
         new_memory_item: TextualMemoryItem,
-        user_id: str,
         user_name: str,
-        operation: dict,
-    ):
-        """update preference memory"""
+    ) -> str:
+        try:
+            updated_item, archived_item, archived_metadata, updated_fields = trigger_single_hook(
+                H.MEMORY_VERSION_APPLY_FEEDBACK_UPDATE,
+                old_item=old_memory_item,
+                new_item=new_memory_item,
+                user_name=user_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Memory Feedback UPDATE] history fallback for %s: %s", old_memory_item.id, e
+            )
+            updated_item = old_memory_item.model_copy(deep=True)
+            updated_item.memory = new_memory_item.memory
+            updated_item.metadata.key = new_memory_item.metadata.key
+            updated_item.metadata.tags = new_memory_item.metadata.tags
+            updated_item.metadata.background = new_memory_item.metadata.background
+            if getattr(new_memory_item.metadata, "sources", None) is not None:
+                current_sources = list(updated_item.metadata.sources or [])
+                updated_item.metadata.sources = (
+                    list(new_memory_item.metadata.sources or []) + current_sources
+                )
+            if getattr(new_memory_item.metadata, "embedding", None) is not None:
+                updated_item.metadata.embedding = new_memory_item.metadata.embedding
+            if updated_item.metadata.memory_type == "PreferenceMemory":
+                updated_item.metadata.preference = updated_item.memory
+            updated_fields = {
+                "memory": updated_item.memory,
+                "key": updated_item.metadata.key,
+                "tags": updated_item.metadata.tags,
+                "embedding": updated_item.metadata.embedding,
+                "background": updated_item.metadata.background,
+                "sources": [
+                    source.model_dump(exclude_none=True)
+                    if hasattr(source, "model_dump")
+                    else source
+                    for source in (updated_item.metadata.sources or [])
+                ],
+                "covered_history": old_memory_item.id,
+            }
+            archived_item = None
+            archived_metadata = None
 
-        feedback_context = new_memory_item.memory
-        if operation and "text" in operation and operation["text"]:
-            new_memory_item.memory = operation["text"]
-            new_memory_item.metadata.embedding = self._batch_embed([operation["text"]])[0]
-
-        to_add_memory = old_memory_item.model_copy(deep=True)
-        to_add_memory.metadata.key = new_memory_item.metadata.key
-        to_add_memory.metadata.tags = new_memory_item.metadata.tags
-        to_add_memory.memory = new_memory_item.memory
-        to_add_memory.metadata.preference = new_memory_item.memory
-        to_add_memory.metadata.embedding = new_memory_item.metadata.embedding
-
-        to_add_memory.metadata.user_id = new_memory_item.metadata.user_id
-        to_add_memory.metadata.original_text = old_memory_item.memory
-        to_add_memory.metadata.covered_history = old_memory_item.id
-
-        to_add_memory.metadata.created_at = to_add_memory.metadata.updated_at = (
-            datetime.now().isoformat()
-        )
-        to_add_memory.metadata.context_summary = (
-            old_memory_item.metadata.context_summary + " \n" + feedback_context
-        )
-
-        # add new memory
-        to_add_memory.id = str(uuid.uuid4())
-        added_ids = self._retry_db_operation(lambda: self.pref_mem.add([to_add_memory]))
-        # delete
-        deleted_id = old_memory_item.id
-        collection_name = old_memory_item.metadata.preference_type
+        if archived_item and archived_metadata:
+            try:
+                self.graph_store.add_node(
+                    id=archived_item.id,
+                    memory=archived_item.memory,
+                    metadata=archived_metadata,
+                    user_name=user_name,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Memory Feedback UPDATE] archive add failed for %s: %s",
+                    old_memory_item.id,
+                    e,
+                )
         self._retry_db_operation(
-            lambda: self.pref_mem.delete_with_collection_name(collection_name, [deleted_id])
+            lambda: self.graph_store.update_node(
+                id=updated_item.id,
+                fields=updated_fields,
+                user_name=user_name,
+            )
         )
-        # add archived
-        old_memory_item.metadata.status = "archived"
-        old_memory_item.metadata.original_text = "archived"
-        old_memory_item.metadata.embedding = [0.0] * 1024
-
-        archived_ids = self._retry_db_operation(lambda: self.pref_mem.add([old_memory_item]))
-
-        logger.info(
-            f"[Memory Feedback UPDATE Pref] New Add:{added_ids!s} | Set archived:{archived_ids!s}"
-        )
-
-        return {
-            "id": to_add_memory.id,
-            "text": new_memory_item.memory,
-            "source_doc_id": "",
-            "archived_id": old_memory_item.id,
-            "origin_memory": old_memory_item.memory,
-            "type": "preference",
-        }
+        self._del_working_binding(user_name, [old_memory_item])
+        return updated_item.id
 
     def _del_working_binding(self, user_name, mem_items: list[TextualMemoryItem]) -> set[str]:
         """Delete working memory bindings"""
@@ -399,9 +416,7 @@ class MemFeedback(BaseMemFeedback):
             f"[Memory Feedback UPDATE] Extracted {len(bindings_to_delete)} working_binding ids to cleanup: {list(bindings_to_delete)}"
         )
 
-        delete_ids = []
-        if bindings_to_delete:
-            delete_ids = list({bindings_to_delete})
+        delete_ids = list(bindings_to_delete)
 
         for mid in delete_ids:
             try:
@@ -414,6 +429,7 @@ class MemFeedback(BaseMemFeedback):
                 logger.warning(
                     f"[0107 Feedback Core:_del_working_binding] TreeTextMemory.delete_hard: failed to delete {mid}: {e}"
                 )
+        return bindings_to_delete
 
     def semantics_feedback(
         self,
@@ -429,9 +445,14 @@ class MemFeedback(BaseMemFeedback):
         lang = detect_lang("".join(memory_item.memory))
         template = FEEDBACK_PROMPT_DICT["compare"][lang]
         if current_memories == []:
-            # retrieve
-            last_user_index = max(i for i, d in enumerate(chat_history_list) if d["role"] == "user")
-            last_qa = " ".join([item["content"] for item in chat_history_list[last_user_index:]])
+            user_indices = [i for i, d in enumerate(chat_history_list) if d["role"] == "user"]
+            if user_indices:
+                last_user_index = max(user_indices)
+                last_qa = " ".join(
+                    [item["content"] for item in chat_history_list[last_user_index:]]
+                )
+            else:
+                last_qa = " ".join([item["content"] for item in chat_history_list])
             supplementary_retrieved = self._retrieve(last_qa, info=info, user_name=user_name)
             feedback_retrieved = self._retrieve(memory_item.memory, info=info, user_name=user_name)
 
@@ -460,7 +481,7 @@ class MemFeedback(BaseMemFeedback):
                 for chunk in memory_chunks:
                     chunk_list = []
                     for item in chunk:
-                        if "preference" in item.metadata.__dict__:
+                        if item.metadata.memory_type == "PreferenceMemory":
                             chunk_list.append(f"{item.id}: {item.metadata.preference}")
                         else:
                             chunk_list.append(f"{item.id}: {item.memory}")
@@ -539,9 +560,22 @@ class MemFeedback(BaseMemFeedback):
                         f"[0107 Feedback Core: semantics_feedback] Operation failed for {original_op}: {e}",
                         exc_info=True,
                     )
-        if update_results:
-            updated_ids = [item["archived_id"] for item in update_results]
-            self._del_working_binding(updated_ids, user_name)
+        if update_results and getattr(self.mem_reader, "memory_version_switch", "off") != "on":
+            archived_ids = [item["archived_id"] for item in update_results]
+            archived_items = []
+            for aid in archived_ids:
+                try:
+                    node = self.graph_store.get_node(aid, user_name=user_name)
+                    if node:
+                        archived_items.append(TextualMemoryItem(**node))
+                except Exception as e:
+                    logger.warning(
+                        "[Memory Feedback] Failed to fetch archived item %s for working_binding cleanup: %s",
+                        aid,
+                        e,
+                    )
+            if archived_items:
+                self._del_working_binding(user_name, archived_items)
 
         return {"record": {"add": add_results, "update": update_results}}
 
@@ -628,15 +662,29 @@ class MemFeedback(BaseMemFeedback):
             edges = self.searcher.graph_store.get_edges(mem_item.id, user_name=user_name)
             return (mem_item, len(edges) == 0)
 
+        logger.info(f"[feedback _retrieve] query: {query}, user_name: {user_name}")
         text_mems = self.searcher.search(
-            query,
+            query=query,
+            top_k=top_k,
             info=info,
             memory_type="AllSummaryMemory",
             user_name=user_name,
-            top_k=top_k,
             full_recall=True,
         )
         text_mems = [item[0] for item in text_mems if float(item[1]) > 0.01]
+
+        if self.pref_feedback:
+            pref_mems = self.searcher.search(
+                query=query,
+                top_k=top_k,
+                info=info,
+                memory_type="PreferenceMemory",
+                user_name=user_name,
+                include_preference_memory=True,
+                full_recall=True,
+            )
+            pref_mems = [item[0] for item in pref_mems if float(item[1]) > 0.01]
+            text_mems.extend(pref_mems)
 
         # Memory with edges is not modified by feedback
         retrieved_mems = []
@@ -656,14 +704,7 @@ class MemFeedback(BaseMemFeedback):
                 f"text memories are not modified by feedback due to edges."
             )
 
-        if self.pref_feedback:
-            pref_info = {}
-            if "user_id" in info:
-                pref_info = {"user_id": info["user_id"]}
-            retrieved_prefs = self.pref_mem.search(query, top_k, pref_info)
-            return retrieved_mems + retrieved_prefs
-        else:
-            return retrieved_mems
+        return retrieved_mems
 
     def _vec_query(self, new_memories_embedding: list[float], user_name=None):
         """Vector retrieval query"""
@@ -1122,7 +1163,14 @@ class MemFeedback(BaseMemFeedback):
                         tags=tags,
                         key=key,
                         embedding=embedding,
-                        sources=[{"type": "chat"}],
+                        sources=[
+                            {
+                                "type": "feedback",
+                                "role": "user",
+                                "chat_time": feedback_time,
+                                "content": feedback_content,
+                            }
+                        ],
                         background=background,
                         type="fine",
                         info=info,

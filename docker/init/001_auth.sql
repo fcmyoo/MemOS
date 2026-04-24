@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_hash VARCHAR(64) NOT NULL UNIQUE,
   key_prefix VARCHAR(12) NOT NULL,
   user_name VARCHAR(255) NOT NULL,
-  scopes JSONB NOT NULL DEFAULT '[read]',
+  scopes JSONB NOT NULL DEFAULT '["read"]',
   description TEXT,
   is_active BOOLEAN NOT NULL DEFAULT true,
   expires_at TIMESTAMPTZ,

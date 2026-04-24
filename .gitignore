@@ -63,8 +63,12 @@ pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 htmlcov/
+report/
+cov-report/
 .tox/
 .nox/
+report/
+cov-report/
 .coverage
 .coverage.*
 .cache
@@ -180,6 +184,20 @@ venv.bak/
 # but do not ignore docs/openapi.json
 !docs/openapi.json
 
+# do not ignore apps/ config files
+!apps/**/*.json
+!apps/**/*.html
+!apps/**/*.ts
+!apps/**/*.tsx
+!apps/**/*.js
+!apps/**/*.cjs
+!apps/**/*.css
+!apps/**/*.md
+!apps/**/*.yaml
+!apps/**/*.yml
+!apps/**/*.svg
+!apps/**/*.sh
+
 
 # mypy
 .mypy_cache/
@@ -212,7 +230,12 @@ cython_debug/
 # DS_Store
 .DS_Store
 
+# OpenWork integration assets (managed separately)
+apps/openwork-memos-integration/apps/desktop/public/assets/usecases/
+
 # Outputs and Evaluation Results
 outputs
 
-evaluation/data/temporal_locomo
+evaluation/data/
+test_add_pipeline.py
+test_file_pipeline.py

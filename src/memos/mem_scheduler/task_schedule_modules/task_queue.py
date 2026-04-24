@@ -48,6 +48,12 @@ class ScheduleTaskQueue:
             self.memos_message_queue = SchedulerLocalQueue(maxsize=self.maxsize)
 
         self.disabled_handlers = disabled_handlers
+        logger.info(
+            "[SCHEDULE_TASK_QUEUE] Initialized queue wrapper. use_redis_queue=%s, queue_type=%s, stream_prefix=%s",
+            self.use_redis_queue,
+            type(self.memos_message_queue).__name__,
+            getattr(self.memos_message_queue, "stream_key_prefix", None),
+        )
 
     def set_status_tracker(self, status_tracker: TaskStatusTracker) -> None:
         """
@@ -93,6 +99,9 @@ class ScheduleTaskQueue:
         """Submit messages to the message queue (either local queue or Redis)."""
         if isinstance(messages, ScheduleMessageItem):
             messages = [messages]
+        if len(messages) < 1:
+            logger.error("submit_messages called with empty payload")
+            return
 
         current_trace_id = get_current_trace_id()
 
@@ -104,18 +113,25 @@ class ScheduleTaskQueue:
                 user_id=msg.user_id, mem_cube_id=msg.mem_cube_id, task_label=msg.label
             )
 
-        if len(messages) < 1:
-            logger.error("Submit empty")
-        elif len(messages) == 1:
+        if len(messages) == 1:
             if getattr(messages[0], "timestamp", None) is None:
                 messages[0].timestamp = get_utc_now()
-            enqueue_ts = to_iso(getattr(messages[0], "timestamp", None))
-            emit_monitor_event(
-                "enqueue",
-                messages[0],
-                {"enqueue_ts": enqueue_ts, "event_duration_ms": 0, "total_duration_ms": 0},
-            )
-            self.memos_message_queue.put(messages[0])
+            if self.disabled_handlers and messages[0].label in self.disabled_handlers:
+                logger.debug(
+                    "Skip disabled handler. label=%s item_id=%s user_id=%s mem_cube_id=%s",
+                    messages[0].label,
+                    messages[0].item_id,
+                    messages[0].user_id,
+                    messages[0].mem_cube_id,
+                )
+            else:
+                enqueue_ts = to_iso(getattr(messages[0], "timestamp", None))
+                emit_monitor_event(
+                    "enqueue",
+                    messages[0],
+                    {"enqueue_ts": enqueue_ts, "event_duration_ms": 0, "total_duration_ms": 0},
+                )
+                self.memos_message_queue.put(messages[0])
         else:
             user_cube_groups = group_messages_by_user_and_mem_cube(messages)
 
@@ -132,8 +148,12 @@ class ScheduleTaskQueue:
                             message.timestamp = get_utc_now()
 
                         if self.disabled_handlers and message.label in self.disabled_handlers:
-                            logger.info(
-                                f"Skipping disabled handler: {message.label} - {message.content}"
+                            logger.debug(
+                                "Skip disabled handler. label=%s item_id=%s user_id=%s mem_cube_id=%s",
+                                message.label,
+                                message.item_id,
+                                message.user_id,
+                                message.mem_cube_id,
                             )
                             continue
 
@@ -148,9 +168,12 @@ class ScheduleTaskQueue:
                             },
                         )
                         self.memos_message_queue.put(message)
-                        logger.info(
-                            f"Submitted message to local queue: {message.label} - {message.content}"
-                        )
+
+        logger.info(
+            "Queue submit completed. backend=%s total=%s",
+            "redis_queue" if self.use_redis_queue else "local_queue",
+            len(messages),
+        )
 
     def get_messages(self, batch_size: int) -> list[ScheduleMessageItem]:
         return self.memos_message_queue.get_messages(batch_size=batch_size)
