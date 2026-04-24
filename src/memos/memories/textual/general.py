@@ -78,7 +78,7 @@ class GeneralTextMemory(BaseTextMemory):
 
         return extracted_memories
 
-    def add(self, memories: list[TextualMemoryItem | dict[str, Any]]) -> None:
+    def add(self, memories: list[TextualMemoryItem | dict[str, Any]], **kwargs) -> list[str]:
         """Add memories.
 
         Args:
@@ -102,8 +102,9 @@ class GeneralTextMemory(BaseTextMemory):
 
         # Add to vector db
         self.vector_db.add(vec_db_items)
+        return [item.id for item in memory_items]
 
-    def update(self, memory_id: str, new_memory: TextualMemoryItem | dict[str, Any]) -> None:
+    def update(self, memory_id: str, new_memory: TextualMemoryItem | dict[str, Any]) -> list[str]:
         """Update a memory by memory_id."""
         memory_item = (
             TextualMemoryItem(**new_memory) if isinstance(new_memory, dict) else new_memory
@@ -154,25 +155,50 @@ class GeneralTextMemory(BaseTextMemory):
         memories = [TextualMemoryItem(**db_item.payload) for db_item in db_items]
         return memories
 
-    def get_all(self) -> list[TextualMemoryItem]:
+    def get_all(
+        self,
+        user_name: str | None = None,
+        user_id: str | None = None,
+        page: int | None = None,
+        page_size: int | None = None,
+        filter: dict | None = None,
+        memory_type: list[str] | None = None,
+    ) -> dict:
         """Get all memories.
         Returns:
-            list[TextualMemoryItem]: List of all memories.
+            dict: {"nodes": list[TextualMemoryItem], "total_nodes": int}
+            Compatible with TreeTextMemory.get_all() interface.
         """
         all_items = self.vector_db.get_all()
         all_memories = [TextualMemoryItem(**memo.payload) for memo in all_items]
-        return all_memories
 
-    def delete(self, memory_ids: list[str]) -> None:
+        # Filter by user_id if provided
+        if user_id:
+            all_memories = [m for m in all_memories if (getattr(m.metadata, "user_id", None) or getattr(m, "user_id", None)) == user_id]
+
+        # Filter by memory_type if provided
+        if memory_type:
+            all_memories = [m for m in all_memories if getattr(m.metadata, "memory_type", None) in memory_type]
+
+        total = len(all_memories)
+
+        # Apply pagination if provided
+        if page is not None and page_size is not None:
+            start = page * page_size
+            all_memories = all_memories[start:start + page_size]
+
+        return {"nodes": all_memories, "total_nodes": total}
+
+    def delete(self, memory_ids: list[str]) -> list[str]:
         """Delete a memory."""
         self.vector_db.delete(memory_ids)
 
-    def delete_all(self) -> None:
+    def delete_all(self) -> list[str]:
         """Delete all memories."""
         self.vector_db.delete_collection(self.vector_db.config.collection_name)
         self.vector_db.create_collection()
 
-    def load(self, dir: str) -> None:
+    def load(self, dir: str) -> list[str]:
         try:
             memory_file = os.path.join(dir, self.config.memory_filename)
 
@@ -194,7 +220,7 @@ class GeneralTextMemory(BaseTextMemory):
         except Exception as e:
             logger.error(f"An error occurred while loading memories: {e}")
 
-    def dump(self, dir: str) -> None:
+    def dump(self, dir: str) -> list[str]:
         """Dump memories to os.path.join(dir, self.config.memory_filename)"""
         try:
             all_vec_db_items = self.vector_db.get_all()
@@ -213,7 +239,7 @@ class GeneralTextMemory(BaseTextMemory):
 
     def drop(
         self,
-    ) -> None:
+    ) -> list[str]:
         pass
 
     def _embed_one_sentence(self, sentence: str) -> list[float]:

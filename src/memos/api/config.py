@@ -1254,37 +1254,61 @@ class APIConfig:
                 {
                     "user_id": "default",
                     "cube_id": "default_cube",
-                    "text_mem": {
-                        "backend": "tree_text",
-                        "config": {
-                            "extractor_llm": {"backend": "openai", "config": openai_config},
-                            "dispatcher_llm": {"backend": "openai", "config": openai_config},
-                            "graph_db": {
-                                "backend": graph_db_backend,
-                                "config": graph_db_backend_map[graph_db_backend],
+                    "text_mem": (
+                        {
+                            "backend": "general_text",
+                            "config": {
+                                "extractor_llm": {"backend": "openai", "config": openai_config},
+                                "embedder": APIConfig.get_embedder_config(),
+                                "vector_db": {
+                                    "backend": "qdrant",
+                                    "config": {
+                                        "collection_name": os.getenv(
+                                            "MOS_QDRANT_COLLECTION", "general_mem_db"
+                                        ),
+                                        "vector_dimension": int(
+                                            os.getenv("EMBEDDING_DIMENSION", 1536)
+                                        ),
+                                        "distance_metric": "cosine",
+                                        "host": os.getenv("QDRANT_HOST", "memos-qdrant"),
+                                        "port": int(os.getenv("QDRANT_PORT", 6333)),
+                                    },
+                                },
                             },
-                            "embedder": APIConfig.get_embedder_config(),
-                            "reranker": APIConfig.get_reranker_config(),
-                            "reorganize": os.getenv("MOS_ENABLE_REORGANIZE", "false").lower()
-                            == "true",
-                            "internet_retriever": internet_config,
-                            "memory_size": {
-                                "WorkingMemory": int(os.getenv("MOS_WORKING_MEMORY", 20)),
-                                "LongTermMemory": int(os.getenv("MOS_LONGTERM_MEMORY", 1e6)),
-                                "UserMemory": int(os.getenv("MOS_USER_MEMORY", 1e6)),
+                        }
+                        if os.getenv("MOS_TEXT_MEM_TYPE", "tree_text") == "general_text"
+                        else {
+                            "backend": "tree_text",
+                            "config": {
+                                "extractor_llm": {"backend": "openai", "config": openai_config},
+                                "dispatcher_llm": {"backend": "openai", "config": openai_config},
+                                "graph_db": {
+                                    "backend": graph_db_backend,
+                                    "config": graph_db_backend_map[graph_db_backend],
+                                },
+                                "embedder": APIConfig.get_embedder_config(),
+                                "reranker": APIConfig.get_reranker_config(),
+                                "reorganize": os.getenv("MOS_ENABLE_REORGANIZE", "false").lower()
+                                == "true",
+                                "internet_retriever": internet_config,
+                                "memory_size": {
+                                    "WorkingMemory": int(os.getenv("MOS_WORKING_MEMORY", 20)),
+                                    "LongTermMemory": int(os.getenv("MOS_LONGTERM_MEMORY", 1e6)),
+                                    "UserMemory": int(os.getenv("MOS_USER_MEMORY", 1e6)),
+                                },
+                                "search_strategy": {
+                                    "fast_graph": bool(os.getenv("FAST_GRAPH", "false") == "true"),
+                                    "bm25": bool(os.getenv("BM25_CALL", "false") == "true"),
+                                    "cot": bool(os.getenv("VEC_COT_CALL", "false") == "true"),
+                                    "fulltext": bool(os.getenv("FULLTEXT_CALL", "false") == "true"),
+                                },
+                                "mode": os.getenv("ASYNC_MODE", "sync"),
+                                "include_embedding": bool(
+                                    os.getenv("INCLUDE_EMBEDDING", "false") == "true"
+                                ),
                             },
-                            "search_strategy": {
-                                "fast_graph": bool(os.getenv("FAST_GRAPH", "false") == "true"),
-                                "bm25": bool(os.getenv("BM25_CALL", "false") == "true"),
-                                "cot": bool(os.getenv("VEC_COT_CALL", "false") == "true"),
-                                "fulltext": bool(os.getenv("FULLTEXT_CALL", "false") == "true"),
-                            },
-                            "mode": os.getenv("ASYNC_MODE", "sync"),
-                            "include_embedding": bool(
-                                os.getenv("INCLUDE_EMBEDDING", "false") == "true"
-                            ),
-                        },
-                    },
+                        }
+                    ),
                     "act_mem": {}
                     if os.getenv("ENABLE_ACTIVATION_MEMORY", "false").lower() == "false"
                     else APIConfig.get_activation_vllm_config(),

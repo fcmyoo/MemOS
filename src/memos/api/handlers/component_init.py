@@ -32,6 +32,7 @@ from memos.mem_reader.factory import MemReaderFactory
 from memos.mem_scheduler.orm_modules.base_model import BaseDBManager
 from memos.mem_scheduler.scheduler_factory import SchedulerFactory
 from memos.memories.textual.simple_tree import SimpleTreeTextMemory
+from memos.memories.textual.general import GeneralTextMemory
 from memos.memories.textual.tree_text_memory.organize.manager import MemoryManager
 from memos.memories.textual.tree_text_memory.retrieve.retrieve_utils import FastTokenizer
 from memos.plugins.component_bootstrap import build_plugin_context
@@ -215,19 +216,27 @@ def init_server() -> dict[str, Any]:
 
     logger.debug("Memory manager initialized")
     tokenizer = FastTokenizer()
-    # Initialize text memory
-    text_mem = SimpleTreeTextMemory(
-        llm=llm,
-        embedder=embedder,
-        mem_reader=mem_reader,
-        graph_db=graph_db,
-        reranker=reranker,
-        memory_manager=memory_manager,
-        config=default_cube_config.text_mem.config,
-        internet_retriever=internet_retriever,
-        tokenizer=tokenizer,
-        include_embedding=bool(os.getenv("INCLUDE_EMBEDDING", "false") == "true"),
-    )
+    # Initialize text memory based on MOS_TEXT_MEM_TYPE
+    text_mem_type = os.getenv("MOS_TEXT_MEM_TYPE", "tree_text")
+    if text_mem_type == "general_text":
+        # general_text uses Qdrant for vector storage, no Neo4j dependency
+        text_mem = GeneralTextMemory(config=default_cube_config.text_mem.config)
+        logger.info("Text memory initialized as GeneralTextMemory (general_text mode, Qdrant)")
+    else:
+        # tree_text uses Neo4j for graph storage
+        text_mem = SimpleTreeTextMemory(
+            llm=llm,
+            embedder=embedder,
+            mem_reader=mem_reader,
+            graph_db=graph_db,
+            reranker=reranker,
+            memory_manager=memory_manager,
+            config=default_cube_config.text_mem.config,
+            internet_retriever=internet_retriever,
+            tokenizer=tokenizer,
+            include_embedding=bool(os.getenv("INCLUDE_EMBEDDING", "false") == "true"),
+        )
+        logger.info("Text memory initialized as SimpleTreeTextMemory (tree_text mode, Neo4j)")
 
     logger.debug("Text memory initialized")
 
@@ -240,25 +249,37 @@ def init_server() -> dict[str, Any]:
 
     logger.debug("MemCube created")
 
-    tree_mem: TreeTextMemory = naive_mem_cube.text_mem
-    searcher: Searcher = tree_mem.get_searcher(
-        manual_close_internet=os.getenv("ENABLE_INTERNET", "true").lower() == "false",
-        moscube=False,
-        process_llm=mem_reader.general_llm,
-    )
-    logger.debug("Searcher created")
+    # For general_text mode, create a minimal searcher wrapper that exposes embedder
+    # (SearchHandler requires searcher.embedder.embed() at init time)
+    if text_mem_type == "general_text":
+        tree_mem = text_mem  # text_mem is GeneralTextMemory in this branch
 
-    # Set searcher to mem_reader
-    mem_reader.set_searcher(searcher)
+        class GeneralTextSearcher:
+            """Minimal searcher wrapper for GeneralTextMemory mode."""
+            def __init__(self, embedder):
+                self.embedder = embedder
 
-    # Initialize feedback server
+        searcher = GeneralTextSearcher(embedder=text_mem.embedder)
+        logger.info("general_text mode: created GeneralTextSearcher wrapper (GeneralTextMemory handles search internally)")
+    else:
+        tree_mem: TreeTextMemory = naive_mem_cube.text_mem
+        searcher: Searcher = tree_mem.get_searcher(
+            manual_close_internet=os.getenv("ENABLE_INTERNET", "true").lower() == "false",
+            moscube=False,
+            process_llm=mem_reader.general_llm,
+        )
+        logger.debug("Searcher created")
+        # Set searcher to mem_reader for tree_text mode
+        mem_reader.set_searcher(searcher)
+
+    # Initialize feedback server (searcher may be None for general_text mode)
     feedback_server = SimpleMemFeedback(
         llm=llm,
         embedder=embedder,
         graph_store=graph_db,
         memory_manager=memory_manager,
         mem_reader=mem_reader,
-        searcher=searcher,
+        searcher=searcher if searcher is not None else None,
         reranker=feedback_reranker,
         pref_feedback=True,
     )
