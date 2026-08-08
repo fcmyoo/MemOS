@@ -7,18 +7,30 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     ports:
-      - "8000:8000"
+      - "${MEMOS_BIND_ADDRESS:-127.0.0.1}:8000:8000"
     env_file:
       - ../.env
     depends_on:
-      - neo4j
-      - qdrant
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     environment:
       - PYTHONPATH=/app/src
       - HF_ENDPOINT=https://hf-mirror.com
       - QDRANT_HOST=qdrant-docker
       - QDRANT_PORT=6333
       - NEO4J_URI=bolt://neo4j-docker:7687
+      - AUTH_ENABLED=${AUTH_ENABLED:-true}
+      - MASTER_KEY_HASH=${MASTER_KEY_HASH:?MASTER_KEY_HASH must be set}
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-memos}
+      - POSTGRES_USER=${POSTGRES_USER:-memos}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     volumes:
       - ../src:/app/src
       - .:/app/docker
@@ -29,8 +41,8 @@ services:
     image: neo4j:5.26.6
     container_name: neo4j-docker
     ports:
-      - "7474:7474"   # HTTP
-      - "7687:7687"   # Bolt
+      - "${NEO4J_BIND_ADDRESS:-127.0.0.1}:7474:7474"   # HTTP
+      - "${NEO4J_BIND_ADDRESS:-127.0.0.1}:7687:7687"   # Bolt
     healthcheck:
       test: wget http://localhost:7474 || exit 1
       interval: 1s
@@ -39,7 +51,7 @@ services:
       start_period: 3s
     environment:
       NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
-      NEO4J_AUTH: "neo4j/12345678"
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}"
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -50,8 +62,8 @@ services:
     image: qdrant/qdrant:v1.15.3
     container_name: qdrant-docker
     ports:
-      - "6333:6333"  # REST API
-      - "6334:6334"  # gRPC API
+      - "${QDRANT_BIND_ADDRESS:-127.0.0.1}:6333:6333"  # REST API
+      - "${QDRANT_BIND_ADDRESS:-127.0.0.1}:6334:6334"  # gRPC API
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
@@ -61,10 +73,32 @@ services:
     networks:
       - memos_network
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: memos-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-memos}
+      POSTGRES_USER: ${POSTGRES_USER:-memos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-memos} -d ${POSTGRES_DB:-memos}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init/001_api_keys.sql:/docker-entrypoint-initdb.d/001_api_keys.sql:ro
+    restart: unless-stopped
+    networks:
+      - memos_network
+
 volumes:
   neo4j_data:
   neo4j_logs:
   qdrant_data:
+  postgres_data:
 
 networks:
   memos_network:

@@ -1,7 +1,9 @@
 # MemOS with Krolik Security Extensions
 #
 # This Dockerfile builds MemOS with authentication, rate limiting, and admin API.
-# It uses the overlay pattern to keep customizations separate from base code.
+# The extension entry point (memos.api.server_api_ext) and all security modules
+# live directly in the repository source tree (src/memos/); no overlay directory
+# is applied, so there is exactly one implementation to maintain.
 
 FROM python:3.11-slim
 
@@ -41,9 +43,6 @@ RUN pip install --no-cache-dir \
     transformers \
     psycopg2-binary \
     redis
-
-# Apply Krolik overlay (AFTER base install to allow easy updates)
-COPY overlays/krolik/ ./src/memos/
 
 # Create data directory
 RUN mkdir -p /data/memos && chown -R memos:memos /data/memos

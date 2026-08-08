@@ -29,10 +29,35 @@ git clone https://github.com/MemTensor/MemOS
 cd MemOS
 ```
 
-#### 在根目录中创建一个 `.env` 文件并设置你的环境变量。
-##### .env 快速模式配置如下，完整模式参考 <a href="https://github.com/MemTensor/MemOS/blob/main/docker/.env.example">.env.example</a>。
+#### 在仓库根目录创建 `.env` 文件并设置你的环境变量（推荐直接从模板复制）：
 
 ```bash
+cp docker/.env.example .env
+```
+
+##### .env 快速模式配置如下（鉴权配置需在模型配置之前填写完成），完整模式参考 <a href="https://github.com/MemTensor/MemOS/blob/main/docker/.env.example">.env.example</a>。
+
+```bash
+
+# ===== API 鉴权（默认开启；仅在隔离的本地开发环境可设置 AUTH_ENABLED=false）=====
+AUTH_ENABLED=true
+# mk_* master key 的 SHA-256 hex 摘要（切勿在此填写明文 master key）
+MASTER_KEY_HASH=<master-key-sha256-hex>
+# INTERNAL_SERVICE_IPS 之外内部调用方的共享 secret
+INTERNAL_SERVICE_SECRET=<internal-service-secret>
+# PostgreSQL（存储 API key hash，启用鉴权时必需）
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=memos
+POSTGRES_USER=memos
+POSTGRES_PASSWORD=<postgres-password>
+# Docker 服务凭据与可选的宿主绑定地址
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=<neo4j-password>
+MEMOS_BIND_ADDRESS=127.0.0.1
+NEO4J_BIND_ADDRESS=127.0.0.1
+QDRANT_BIND_ADDRESS=127.0.0.1
+POSTGRES_BIND_ADDRESS=127.0.0.1
 
 # OpenAI API 密钥 (需自定义配置)
 OPENAI_API_KEY=sk-xxx
@@ -66,8 +91,7 @@ MOS_RERANKER_BACKEND=cosine_local
 NEO4J_BACKEND=neo4j-community
 # 当 backend=neo4j* 时必须
 NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=12345678
+# NEO4J_USER / NEO4J_PASSWORD 已移至上方鉴权段配置
 NEO4J_DB_NAME=neo4j
 MOS_NEO4J_SHARED_DB=false
 
@@ -78,6 +102,53 @@ DEFAULT_USE_REDIS_QUEUE=false
 ENABLE_CHAT_API=true
 # 聊天模型列表 可以通过百炼申请. 模型可自选
 CHAT_MODEL_LIST=[{"backend": "qwen", "api_base": "https://xxx/v1", "api_key": "sk-xxx", "model_name_or_path": "qwen3-max", "extra_body": {"enable_thinking": true} ,"support_models": ["qwen3-max"]}]
+```
+
+#### 生成鉴权密钥
+
+复制模板后，`.env` 中的鉴权密钥/hash 均为空，必须先生成并填写，否则 Compose 启动时会因 required interpolation 直接失败。示例只使用占位符，不要在任何文档或提交中放入真实 secret/hash。
+
+```bash
+# 生成 INTERNAL_SERVICE_SECRET / POSTGRES_PASSWORD / NEO4J_PASSWORD（每个变量单独生成一次）
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+
+# 在受控终端生成 master key 及其 SHA-256 hash（明文 master key 仅显示这一次）
+python -c "from memos.api.utils.api_keys import generate_master_key; key, digest = generate_master_key(); print(f'ONE_TIME_MASTER_KEY={key}'); print(f'MASTER_KEY_HASH={digest}')"
+```
+
+- `ONE_TIME_MASTER_KEY`（`mk_*` 前缀）请立即存入调用方自己的 secret manager，由调用方保存明文；**不要**写入 `.env`、提交到仓库或存入数据库，`.env` 中只填写 `MASTER_KEY_HASH`。
+- `AUTH_ENABLED=false` 仅作为隔离开发环境的显式回退，不应作为示例默认值。
+
+#### 创建普通 API key（离线创建）
+
+默认入口不提供 `/admin/keys` 管理接口；普通 API key 使用现有 utility 在受控终端离线创建（在 `docker/` 目录下执行）。输出的 `API_KEY` 同样立即存入调用方 secret manager，不写入文件：
+
+```bash
+docker compose --env-file ../.env exec -T memos python - <<'PY'
+import os
+import psycopg2
+
+from memos.api.utils.api_keys import create_api_key_in_db
+
+connection = psycopg2.connect(
+    host=os.environ["POSTGRES_HOST"],
+    port=int(os.environ["POSTGRES_PORT"]),
+    dbname=os.environ["POSTGRES_DB"],
+    user=os.environ["POSTGRES_USER"],
+    password=os.environ["POSTGRES_PASSWORD"],
+)
+try:
+    generated = create_api_key_in_db(
+        connection,
+        user_name="bootstrap-client",
+        scopes=["read", "write"],
+        description="initial self-hosted client",
+        created_by="offline-bootstrap",
+    )
+    print(f"API_KEY={generated.key}")
+finally:
+    connection.close()
+PY
 ```
 
 ### 3、以百炼为例自定义配置
@@ -120,8 +191,7 @@ MOS_RERANKER_BACKEND=cosine_local
 NEO4J_BACKEND=neo4j-community
 # 当 backend=neo4j* 时必须
 NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=12345678
+# NEO4J_USER / NEO4J_PASSWORD 已移至上方鉴权段配置
 NEO4J_DB_NAME=neo4j
 MOS_NEO4J_SHARED_DB=false
 
@@ -199,8 +269,8 @@ CMD ["uvicorn", "memos.api.server_api:app", "--host", "0.0.0.0", "--port", "8000
 
 #### 构建并启动服务 ：
 ```bash
-# 在docker目录下
-docker compose up
+# 在docker目录下，--env-file 指向根目录 .env（鉴权密钥/hash 等必填项缺失时启动会直接失败）
+docker compose --env-file ../.env up --build
 ```
 ![MemOS buildComposeupSuccess](https://cdn.memtensor.com.cn/img/memos_build_composeup_success_compressed.png)
 <div style="text-align: center; margin-top: 10px">示例图片，端口按 docker 自定义的配置</div>
@@ -246,10 +316,10 @@ pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt -i h
 
 ```bash
 
-# 首次运行需要build
-docker compose up --build
+# 首次运行需要build（在 docker/ 目录下执行，--env-file 指向根目录 .env）
+docker compose --env-file ../.env up --build
 # 再次运行则不需要
-docker compose up
+docker compose --env-file ../.env up
 
 ```
 
@@ -259,8 +329,13 @@ docker compose up
 
 #####  (查询用户记忆（没有继续往后）->添加用户记忆->查询用户记忆)
 
+> 鉴权默认开启：调用受保护接口需在请求头中携带 `Authorization: Bearer <master-or-api-key>`（master key 或按上文离线创建的普通 API key）。
+
 ##### 添加用户记忆 http://localhost:8000/product/add (POST)
 ```bash
+# 请求头
+Authorization: Bearer <master-or-api-key>
+Content-Type: application/json
 # 请求参数
 {
   "user_id": "8736b16e-1d20-4163-980b-a5063c3facdc",
@@ -283,6 +358,9 @@ docker compose up
 
 ##### 查询用户记忆 http://localhost:8000/product/search (POST)
 ```bash
+# 请求头
+Authorization: Bearer <master-or-api-key>
+Content-Type: application/json
 # 请求参数
 {
   "query": "我喜欢什么",
@@ -398,7 +476,7 @@ export PYTHONPATH=/you-file-absolute-path/MemOS/src
 
 #### 访问 API
 
-启动完成后，通过 [http://localhost:8000/docs](http://localhost:8000/docs) 访问 API。
+启动完成后，通过 [http://localhost:8000/docs](http://localhost:8000/docs) 访问 API。鉴权默认开启，调用受保护接口需携带请求头 `Authorization: Bearer <master-or-api-key>`。
 
 
 ::
@@ -482,6 +560,8 @@ uvicorn memos.api.product_api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 #### 服务器运行后,您可以使用OpenAPI文档测试API，网址为 [http://localhost:8000/docs](http://localhost:8000/docs) 或者 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+鉴权默认开启（`AUTH_ENABLED=true`），`.env` 需按上文完成鉴权密钥配置；调用受保护接口需携带请求头 `Authorization: Bearer <master-or-api-key>`。
 
 #### 测试用例 (注册用户->添加用户记忆->查询用户记忆) 参考Docker Compose up测试用例
 

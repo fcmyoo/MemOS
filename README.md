@@ -147,10 +147,21 @@ You want to run MemOS as a REST service on your own machine or cluster.
 ```bash
 git clone https://github.com/MemTensor/MemOS.git
 cd MemOS
-cp docker/.env.example .env          # fill in your API keys in .env
+cp docker/.env.example .env                # fill in model API keys and auth secrets in .env
 cd docker
-docker compose up                    # starts MemOS API + Neo4j + Qdrant
+docker compose --env-file ../.env up --build   # starts MemOS API + Neo4j + Qdrant + PostgreSQL
 ```
+
+Authentication is **enabled by default**. Generate the credentials in a controlled terminal and fill them into `.env` before starting (Compose fails fast if any required secret/hash is empty):
+
+```bash
+# INTERNAL_SERVICE_SECRET / POSTGRES_PASSWORD / NEO4J_PASSWORD (generate one value per variable)
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+# Master key (shown ONCE) and its SHA-256 digest for MASTER_KEY_HASH
+python -c "from memos.api.utils.api_keys import generate_master_key; key, digest = generate_master_key(); print(f'ONE_TIME_MASTER_KEY={key}'); print(f'MASTER_KEY_HASH={digest}')"
+```
+
+Store `ONE_TIME_MASTER_KEY` (`mk_*`) in your secret manager and never write the plaintext key into `.env` — only `MASTER_KEY_HASH` goes there. Set `AUTH_ENABLED=false` only as an explicit fallback for isolated local development.
 
 The API is served at `http://localhost:8000`.
 
@@ -159,8 +170,8 @@ The API is served at `http://localhost:8000`.
 ```bash
 git clone https://github.com/MemTensor/MemOS.git
 cd MemOS
-cp docker/.env.example .env          # fill in your API keys in .env
-# Ensure Neo4j and Qdrant are running, then:
+cp docker/.env.example .env          # fill in model API keys and auth secrets (same as Option A)
+# Ensure Neo4j, Qdrant, and PostgreSQL are running (PostgreSQL is required while AUTH_ENABLED=true), then:
 cd src
 uvicorn memos.api.server_api:app --host 0.0.0.0 --port 8000 --workers 1
 ```
@@ -172,7 +183,11 @@ See `[docker/.env.example](./docker/.env.example)` for all configuration options
 ```python
 import requests, json
 
-headers = {"Content-Type": "application/json"}
+headers = {
+    "Content-Type": "application/json",
+    # Auth is enabled by default: use the master key (mk_*) or an issued API key
+    "Authorization": "Bearer <master-or-api-key>",
+}
 base = "http://localhost:8000/product"
 
 # 1. Create a memory cube

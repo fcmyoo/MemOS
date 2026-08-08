@@ -29,10 +29,35 @@ git clone https://github.com/MemTensor/MemOS
 cd MemOS
 ```
 
-#### Create a `.env` file in the root directory and set your environment variables.
-##### .env The quick mode configuration is as follows, Complete Mode Reference <a href="https://github.com/MemTensor/MemOS/blob/main/docker/.env.example">.env.example</a>.
+#### Create a `.env` file in the repository root directory and set your environment variables (copying from the template is recommended):
 
 ```bash
+cp docker/.env.example .env
+```
+
+##### .env The quick mode configuration is as follows (the authentication section must be filled in before the model configuration), Complete Mode Reference <a href="https://github.com/MemTensor/MemOS/blob/main/docker/.env.example">.env.example</a>.
+
+```bash
+
+# ===== API authentication (enabled by default; set AUTH_ENABLED=false only for isolated local development) =====
+AUTH_ENABLED=true
+# SHA-256 hex digest of the mk_* master key (never place the plaintext master key here)
+MASTER_KEY_HASH=<master-key-sha256-hex>
+# Shared secret for internal callers outside INTERNAL_SERVICE_IPS
+INTERNAL_SERVICE_SECRET=<internal-service-secret>
+# PostgreSQL backing store for API key hashes (required while auth is enabled)
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=memos
+POSTGRES_USER=memos
+POSTGRES_PASSWORD=<postgres-password>
+# Docker service credentials and optional host bindings
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=<neo4j-password>
+MEMOS_BIND_ADDRESS=127.0.0.1
+NEO4J_BIND_ADDRESS=127.0.0.1
+QDRANT_BIND_ADDRESS=127.0.0.1
+POSTGRES_BIND_ADDRESS=127.0.0.1
 
 # OpenAI API Key (Custom configuration required)
 OPENAI_API_KEY=sk-xxx
@@ -66,8 +91,7 @@ MOS_RERANKER_BACKEND=cosine_local
 NEO4J_BACKEND=neo4j-community
 # required when backend=neo4j*
 NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=12345678
+# NEO4J_USER / NEO4J_PASSWORD moved to the authentication section above
 NEO4J_DB_NAME=neo4j
 MOS_NEO4J_SHARED_DB=false
 
@@ -79,6 +103,53 @@ ENABLE_CHAT_API=true
 # Chat Model List can apply through Bailian. Models are selectable.
 CHAT_MODEL_LIST=[{"backend": "qwen", "api_base": "https://xxx/v1", "api_key": "sk-xxx", "model_name_or_path": "qwen3-max", "extra_body": {"enable_thinking": true} ,"support_models": ["qwen3-max"]}]
 
+```
+
+#### Generate authentication credentials
+
+After copying the template, the auth secrets/hashes in `.env` are empty. You must generate and fill them in before startup, otherwise Compose fails fast via required interpolation. Examples use placeholders only — never put a real secret/hash into docs or commits.
+
+```bash
+# INTERNAL_SERVICE_SECRET / POSTGRES_PASSWORD / NEO4J_PASSWORD (generate one value per variable)
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+
+# Generate the master key and its SHA-256 digest in a controlled terminal (the plaintext master key is shown only ONCE)
+python -c "from memos.api.utils.api_keys import generate_master_key; key, digest = generate_master_key(); print(f'ONE_TIME_MASTER_KEY={key}'); print(f'MASTER_KEY_HASH={digest}')"
+```
+
+- Store `ONE_TIME_MASTER_KEY` (`mk_*` prefix) in the caller's own secret manager immediately; the caller keeps the plaintext. **Never** write it into `.env`, commit it to the repository, or store it in the database — only `MASTER_KEY_HASH` goes into `.env`.
+- `AUTH_ENABLED=false` is only an explicit fallback for isolated development environments and should not be the example default.
+
+#### Create a regular API key (offline creation)
+
+The default entry point does not expose the `/admin/keys` management endpoints; a regular API key can be created offline with the existing utility in a controlled terminal (run from the `docker/` directory). The printed `API_KEY` likewise goes straight into the caller's secret manager, never into a file:
+
+```bash
+docker compose --env-file ../.env exec -T memos python - <<'PY'
+import os
+import psycopg2
+
+from memos.api.utils.api_keys import create_api_key_in_db
+
+connection = psycopg2.connect(
+    host=os.environ["POSTGRES_HOST"],
+    port=int(os.environ["POSTGRES_PORT"]),
+    dbname=os.environ["POSTGRES_DB"],
+    user=os.environ["POSTGRES_USER"],
+    password=os.environ["POSTGRES_PASSWORD"],
+)
+try:
+    generated = create_api_key_in_db(
+        connection,
+        user_name="bootstrap-client",
+        scopes=["read", "write"],
+        description="initial self-hosted client",
+        created_by="offline-bootstrap",
+    )
+    print(f"API_KEY={generated.key}")
+finally:
+    connection.close()
+PY
 ```
 
 ### 3、Taking Bailian as an example to customize configuration
@@ -121,8 +192,7 @@ MOS_RERANKER_BACKEND=cosine_local
 NEO4J_BACKEND=neo4j-community
 # required when backend=neo4j*
 NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=12345678
+# NEO4J_USER / NEO4J_PASSWORD moved to the authentication section above
 NEO4J_DB_NAME=neo4j
 MOS_NEO4J_SHARED_DB=false
 
@@ -200,8 +270,8 @@ CMD ["uvicorn", "memos.api.server_api:app", "--host", "0.0.0.0", "--port", "8000
 ```
 #### Build and start service using docker compose up:
 ```bash
-# Enter docker directory
-docker compose up
+# In the docker directory; --env-file points at the root .env (startup fails fast if required auth secrets/hashes are missing)
+docker compose --env-file ../.env up --build
 ```
 ![MemOS buildComposeupSuccess](https://cdn.memtensor.com.cn/img/memos_build_composeup_success_compressed.png)
 <div style="text-align: center; margin-top: 10px">Example image, port as per docker custom configuration</div>
@@ -243,10 +313,10 @@ pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 ```bash
 
-# Build required for first run
-docker compose up --build
+# Build required for first run (run in the docker/ directory; --env-file points at the root .env)
+docker compose --env-file ../.env up --build
 # Not required for subsequent runs
-docker compose up
+docker compose --env-file ../.env up
 
 ```
 
@@ -256,8 +326,13 @@ docker compose up
 
 #####  (Query user memory (stop if none) -> Add user memory -> Query user memory)
 
+> Authentication is enabled by default: protected endpoints require the request header `Authorization: Bearer <master-or-api-key>` (the master key or a regular API key created offline as described above).
+
 ##### Add User Memory http://localhost:8000/product/add (POST)
 ```bash
+# Request headers
+Authorization: Bearer <master-or-api-key>
+Content-Type: application/json
 # Request params
 {
   "user_id": "8736b16e-1d20-4163-980b-a5063c3facdc",
@@ -283,6 +358,9 @@ docker compose up
 
 ##### Query User Memory http://localhost:8000/product/search (POST)
 ```bash
+# Request headers
+Authorization: Bearer <master-or-api-key>
+Content-Type: application/json
 # Request params
 {
   "query": "What do I like",
@@ -397,7 +475,7 @@ export PYTHONPATH=/you-file-absolute-path/MemOS/src
 
 #### Access API
 
-After startup is complete, access API via [http://localhost:8000/docs](http://localhost:8000/docs).
+After startup is complete, access API via [http://localhost:8000/docs](http://localhost:8000/docs). Authentication is enabled by default; protected endpoints require the request header `Authorization: Bearer <master-or-api-key>`.
 
 
 ::
@@ -481,6 +559,8 @@ uvicorn memos.api.product_api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 #### After server runs, you can use OpenAPI docs to test API, URL is [http://localhost:8000/docs](http://localhost:8000/docs) or [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+Authentication is enabled by default (`AUTH_ENABLED=true`); complete the auth secret configuration in `.env` as described above. Protected endpoints require the request header `Authorization: Bearer <master-or-api-key>`.
 
 #### Test cases (Register user->Add user memory->Query user memory) Refer to Docker Compose up test cases
 
