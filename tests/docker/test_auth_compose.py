@@ -11,9 +11,11 @@ on a host with Docker to complement these checks.
 """
 
 import re
+
 from pathlib import Path
 
 import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_PATH = REPO_ROOT / "docker" / "docker-compose.yml"

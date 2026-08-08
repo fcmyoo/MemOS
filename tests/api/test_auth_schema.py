@@ -10,9 +10,11 @@ a Docker-backed integration run (execute the script twice, then exercise
 """
 
 import re
+
 from pathlib import Path
 
 import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SQL_PATH = REPO_ROOT / "docker" / "postgres" / "init" / "001_api_keys.sql"

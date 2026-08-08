@@ -338,4 +338,4 @@ def test_auth_configuration_loads_dotenv_before_constants(monkeypatch, tmp_path)
     # If constants were computed before load_dotenv(), AUTH_ENABLED would
     # still be the (now fail-closed) default True and the hash would be None.
     assert auth.AUTH_ENABLED is False
-    assert auth.MASTER_KEY_HASH == fake_hash
+    assert fake_hash == auth.MASTER_KEY_HASH
