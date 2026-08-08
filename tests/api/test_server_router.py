@@ -57,6 +57,15 @@ def mock_init_server():
         # Import after patching
         from memos.api import server_api
 
+        # Auth hardening: /product/* is now behind verify_api_key by default.
+        # These format-validation tests are not about auth, so bypass the
+        # dependency with the exact object the entry point bound at import time
+        # (keying on a fresh import would miss after other tests reload auth).
+        server_api.app.dependency_overrides[server_api.verify_api_key] = lambda: {
+            "user_name": "test",
+            "scopes": ["all"],
+            "is_master_key": False,
+        }
         yield server_api.app
 
 
