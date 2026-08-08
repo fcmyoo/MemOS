@@ -21,7 +21,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -30,6 +30,7 @@ from starlette.responses import Response
 
 # Import Krolik extensions
 from memos.api.lifecycle import shutdown_components
+from memos.api.middleware.auth import verify_api_key
 from memos.api.middleware.rate_limit import RateLimitMiddleware
 
 # Import base routers from MemOS
@@ -105,7 +106,7 @@ if RATE_LIMIT_ENABLED:
     logger.info("Rate limiting enabled")
 
 # Include routers
-app.include_router(server_router_module.router)
+app.include_router(server_router_module.router, dependencies=[Depends(verify_api_key)])
 app.include_router(admin_router)
 
 # Exception handlers
@@ -124,7 +125,7 @@ async def health_check():
     return {
         "status": "healthy",
         "version": "2.0.3-krolik",
-        "auth_enabled": os.getenv("AUTH_ENABLED", "false").lower() == "true",
+        "auth_enabled": os.getenv("AUTH_ENABLED", "true").lower() == "true",
         "rate_limit_enabled": RATE_LIMIT_ENABLED,
     }
 

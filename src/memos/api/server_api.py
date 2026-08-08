@@ -5,12 +5,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from starlette.staticfiles import StaticFiles
 
 from memos.api.exceptions import APIExceptionHandler
 from memos.api.lifecycle import shutdown_components
+from memos.api.middleware.auth import verify_api_key
 from memos.api.middleware.request_context import RequestContextMiddleware
 from memos.api.routers import server_router as server_router_module
 from memos.plugins.manager import plugin_manager
@@ -47,7 +48,7 @@ app.mount("/download", StaticFiles(directory=os.getenv("FILE_LOCAL_PATH")), name
 
 app.add_middleware(RequestContextMiddleware, source="server_api")
 # Include routers
-app.include_router(server_router_module.router)
+app.include_router(server_router_module.router, dependencies=[Depends(verify_api_key)])
 
 
 @app.get("/health")

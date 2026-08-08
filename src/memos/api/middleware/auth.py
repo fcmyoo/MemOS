@@ -6,11 +6,13 @@ Keys are validated against SHA-256 hashes stored in PostgreSQL.
 """
 
 import hashlib
+import hmac
 import os
-import time
 
+from datetime import UTC, datetime
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
@@ -22,9 +24,17 @@ logger = memos.log.get_logger(__name__)
 # API key header configuration
 API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 
+# Load .env before the environment-derived constants below: both server entry
+# points import verify_api_key at module import time, so relying on a later
+# load_dotenv() (server_api.py) or none at all (server_api_ext.py) would leave
+# AUTH_ENABLED / MASTER_KEY_HASH / INTERNAL_SERVICE_SECRET stale. Process
+# environment variables still take precedence over .env values.
+load_dotenv()
+
 # Environment configuration
-AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
 MASTER_KEY_HASH = os.getenv("MASTER_KEY_HASH")  # SHA-256 hash of master key
+INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET")
 INTERNAL_SERVICE_IPS = {"127.0.0.1", "::1", "memos-mcp", "moltbot", "clawdbot"}
 
 # Connection pool for auth queries (lazy init)
@@ -53,7 +63,7 @@ def _get_auth_pool():
         logger.info("Auth database pool initialized")
         return _auth_pool
     except Exception as e:
-        logger.error(f"Failed to initialize auth pool: {e}")
+        logger.error("Failed to initialize auth pool: %s", e)
         return None
 
 
@@ -113,12 +123,12 @@ async def lookup_api_key(key_hash: str) -> dict[str, Any] | None:
 
             # Check if key is active
             if not is_active:
-                logger.warning(f"Inactive API key used: {key_hash[:16]}...")
+                logger.warning("Inactive API key used: %s...", key_hash[:16])
                 return None
 
-            # Check expiration
-            if expires_at and expires_at < time.time():
-                logger.warning(f"Expired API key used: {key_hash[:16]}...")
+            # Check expiration (PostgreSQL TIMESTAMPTZ yields aware datetimes)
+            if expires_at and expires_at <= datetime.now(UTC):
+                logger.warning("Expired API key used: %s...", key_hash[:16])
                 return None
 
             # Update last_used_at
@@ -134,7 +144,7 @@ async def lookup_api_key(key_hash: str) -> dict[str, Any] | None:
                 "scopes": scopes or ["read"],
             }
     except Exception as e:
-        logger.error(f"Database error during key lookup: {e}")
+        logger.error("Database error during key lookup: %s", e)
         return None
     finally:
         if conn and pool:
@@ -149,9 +159,14 @@ def is_internal_request(request: Request) -> bool:
     if client_host in INTERNAL_SERVICE_IPS:
         return True
 
-    # Check internal header (for container-to-container)
+    # Check internal header (for container-to-container). Both the configured
+    # secret and the presented header must be non-empty, so an unset secret
+    # can never match a missing header; compare in constant time.
     internal_header = request.headers.get("X-Internal-Service")
-    return internal_header == os.getenv("INTERNAL_SERVICE_SECRET")
+    return bool(INTERNAL_SERVICE_SECRET and internal_header) and hmac.compare_digest(
+        internal_header,
+        INTERNAL_SERVICE_SECRET,
+    )
 
 
 async def verify_api_key(
@@ -180,7 +195,10 @@ async def verify_api_key(
 
     # Allow internal services
     if is_internal_request(request):
-        logger.debug(f"Internal request from {request.client.host}")
+        logger.debug(
+            "Internal request from %s",
+            request.client.host if request.client else "unknown",
+        )
         return {
             "user_name": "internal",
             "scopes": ["all"],
@@ -222,13 +240,13 @@ async def verify_api_key(
     # Look up in database
     key_data = await lookup_api_key(key_hash)
     if not key_data:
-        logger.warning(f"Invalid API key attempt: {get_key_prefix(api_key)}...")
+        logger.warning("Invalid API key attempt: %s...", get_key_prefix(api_key))
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired API key",
         )
 
-    logger.debug(f"Authenticated user: {key_data['user_name']}")
+    logger.debug("Authenticated user: %s", key_data["user_name"])
     return {
         "user_name": key_data["user_name"],
         "scopes": key_data["scopes"],
