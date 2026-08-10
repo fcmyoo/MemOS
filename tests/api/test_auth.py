@@ -12,10 +12,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from fastapi import HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from memos.api.middleware import auth
+from memos.context.context import RequestContext, get_current_user_name, set_request_context
 
 
 EXTERNAL_CLIENT = ("203.0.113.7", 40000)
@@ -339,3 +341,130 @@ def test_auth_configuration_loads_dotenv_before_constants(monkeypatch, tmp_path)
     # still be the (now fail-closed) default True and the hash would be None.
     assert auth.AUTH_ENABLED is False
     assert fake_hash == auth.MASTER_KEY_HASH
+
+
+# ---------------------------------------------------------------------------
+# P0-1: authenticated identity must be published to request.state and the
+# request context (plan section 3.1).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def seeded_context():
+    """Ensure the request context is cleared after tests that seed it."""
+    yield
+    set_request_context(None)
+
+
+# 16. Successful authentication publishes identity to request.state.
+async def test_verify_api_key_injects_auth_into_request_state(auth_enabled, monkeypatch):
+    async def _lookup(key_hash):
+        return {"id": "key-1", "user_name": "alice", "scopes": ["read", "write"]}
+
+    monkeypatch.setattr(auth, "lookup_api_key", _lookup)
+    request = make_request()
+
+    result = await auth.verify_api_key(request, f"Bearer {REGULAR_KEY}")
+
+    assert result == {
+        "user_name": "alice",
+        "scopes": ["read", "write"],
+        "is_master_key": False,
+        "api_key_id": "key-1",
+    }
+    assert request.state.auth == result
+    assert request.state.user == "alice"
+
+
+# 17. Authenticated user overrides a spoofed X-User-Name header in the context.
+async def test_authenticated_user_overrides_spoofed_header_in_context(
+    auth_enabled, monkeypatch, seeded_context
+):
+    async def _lookup(key_hash):
+        return {"id": "key-1", "user_name": "alice", "scopes": ["read"]}
+
+    monkeypatch.setattr(auth, "lookup_api_key", _lookup)
+
+    # RequestContextMiddleware seeds user_name from the (spoofable) header
+    # before authentication runs.
+    set_request_context(RequestContext(user_name="victim"))
+    request = make_request(headers={"X-User-Name": "victim"})
+
+    result = await auth.verify_api_key(request, f"Bearer {REGULAR_KEY}")
+
+    assert result["user_name"] == "alice"
+    assert request.state.user == "alice"
+    assert get_current_user_name() == "alice"
+
+
+# 18. get_current_user re-publishes even when verify_api_key is overridden.
+def test_get_current_user_publishes_dependency_override_result():
+    app = FastAPI()
+
+    @app.get("/whoami")
+    async def whoami(request: Request, current_user: dict = Depends(auth.get_current_user)):
+        return {
+            "user": current_user["user_name"],
+            "state_user": request.state.user,
+            "state_auth": request.state.auth,
+        }
+
+    override_auth = {"user_name": "override-user", "scopes": ["all"], "is_master_key": False}
+    app.dependency_overrides[auth.verify_api_key] = lambda: override_auth
+
+    with TestClient(app) as client:
+        response = client.get("/whoami")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "user": "override-user",
+        "state_user": "override-user",
+        "state_auth": override_auth,
+    }
+
+
+# 19. AUTH_ENABLED=false keeps header identity (or "default") and the bypass flag.
+async def test_auth_disabled_keeps_header_identity(monkeypatch, seeded_context):
+    monkeypatch.setattr(auth, "AUTH_ENABLED", False)
+
+    # With an X-User-Name header the header identity is kept.
+    set_request_context(RequestContext(user_name="bob"))
+    request = make_request(headers={"X-User-Name": "bob"})
+    result = await auth.verify_api_key(request, None)
+
+    assert result["auth_bypassed"] is True
+    assert result["user_name"] == "bob"
+    assert request.state.user == "bob"
+    assert get_current_user_name() == "bob"
+
+    # Without the header the identity falls back to "default".
+    set_request_context(RequestContext(user_name="default"))
+    request_no_header = make_request()
+    result_no_header = await auth.verify_api_key(request_no_header, None)
+
+    assert result_no_header["auth_bypassed"] is True
+    assert result_no_header["user_name"] == "default"
+    assert request_no_header.state.user == "default"
+    assert get_current_user_name() == "default"
+
+
+# 20. Master and internal short-circuit branches also publish state/context.
+async def test_master_and_internal_auth_are_published(auth_enabled, monkeypatch, seeded_context):
+    monkeypatch.setattr(auth, "MASTER_KEY_HASH", MASTER_KEY_HASH)
+    set_request_context(RequestContext(user_name="victim"))
+
+    master_request = make_request()
+    master_result = await auth.verify_api_key(master_request, f"Bearer {MASTER_KEY}")
+
+    assert master_result["is_master_key"] is True
+    assert master_request.state.auth == master_result
+    assert master_request.state.user == "admin"
+    assert get_current_user_name() == "admin"
+
+    internal_request = make_request(client=("127.0.0.1", 40000))
+    internal_result = await auth.verify_api_key(internal_request, None)
+
+    assert internal_result["is_internal"] is True
+    assert internal_request.state.auth == internal_result
+    assert internal_request.state.user == "internal"
+    assert get_current_user_name() == "internal"

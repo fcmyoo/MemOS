@@ -41,10 +41,22 @@ def mock_init_server():
         # Import after patching
         from fastapi import FastAPI
 
-        from memos.api.routers.server_router import router
+        from memos.api.routers.server_router import get_current_user, router
 
         app = FastAPI()
         app.include_router(router)
+        # Auth hardening: /product/* is behind verify_api_key by default.
+        # These cube-management tests are not about auth, so bypass the
+        # current-user dependency entirely with a privileged (master-key)
+        # identity that keeps legacy semantics (no SQLite lookups).
+        # NB: take get_current_user from the router module's namespace — the
+        # endpoints' Depends() binds to that exact object; importing from
+        # middleware.auth directly breaks after another test file reloads auth.
+        app.dependency_overrides[get_current_user] = lambda: {
+            "user_name": "test",
+            "scopes": ["all"],
+            "is_master_key": True,
+        }
         yield app
 
 
