@@ -7,7 +7,7 @@
 
 以上是运行和部署 API 的默认通用方式。
 
-## 扩展功能与参考实现
+## 单一入口与兼容别名
 
-- **`server_api_ext.py`** 和 **`Dockerfile.krolik`** 是某位开发者扩展后的 API 及部署配置，**仅供参考**。这些内容尚未与云服务集成，仍处于测试阶段。
-- 如需扩展或自定义行为，可参考上述文件，按需使用或改造。
+- **`server_api.py`** 是唯一的 API 入口，已内置鉴权（`AUTH_ENABLED`）、限流（`RATE_LIMIT_ENABLED`）、安全响应头与 CORS 配置；**`docker/Dockerfile`** 与 **`docker/Dockerfile.krolik`** 均使用该入口。
+- **`server_api_ext.py`** 仅保留为 deprecated 兼容导入别名（转发 `memos.api.server_api:app`），不作为部署入口。

@@ -163,7 +163,7 @@ python -c "from memos.api.utils.api_keys import generate_master_key; key, digest
 
 Store `ONE_TIME_MASTER_KEY` (`mk_*`) in your secret manager and never write the plaintext key into `.env` — only `MASTER_KEY_HASH` goes there. Set `AUTH_ENABLED=false` only as an explicit fallback for isolated local development.
 
-The API is served at `http://localhost:8000`.
+The API is served at `http://localhost:8000`. `memos.api.server_api:app` is the single entry point and already includes the admin routes, rate limiting, security headers and CORS; `server_api_ext` is kept only as a deprecated import-compatibility alias and must not be used as a deployment entry point.
 
 **Option B — Run with uvicorn (without Docker):**
 
