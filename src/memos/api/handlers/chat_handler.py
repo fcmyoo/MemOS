@@ -14,7 +14,7 @@ import traceback
 
 from collections.abc import Generator
 from datetime import datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -46,6 +46,10 @@ from memos.templates.mos_prompts import (
     get_memos_prompt,
 )
 from memos.types import MessageList
+
+
+if TYPE_CHECKING:
+    from memos.api.middleware.auth import AuthContext
 
 
 class ChatHandler(BaseHandler):
@@ -102,12 +106,17 @@ class ChatHandler(BaseHandler):
         )
         self.dependencies = dependencies
 
-    def handle_chat_complete(self, chat_req: APIChatCompleteRequest) -> dict[str, Any]:
+    def handle_chat_complete(
+        self,
+        chat_req: APIChatCompleteRequest,
+        current_user: "AuthContext | None" = None,
+    ) -> dict[str, Any]:
         """
         Chat with MemOS for chat complete response (non-streaming).
 
         Args:
             chat_req: Chat complete request
+            current_user: Authenticated request identity from the router.
 
         Returns:
             Dictionary with chat complete response and reasoning
@@ -116,14 +125,23 @@ class ChatHandler(BaseHandler):
             HTTPException: If chat fails
         """
         self.logger.info(f"[ChatHandler] Chat Req is: {chat_req}")
-        try:
-            # Resolve readable cube IDs (for search)
-            readable_cube_ids = chat_req.readable_cube_ids or [chat_req.user_id]
 
+        # Resolve the actor and validate the read+write cube union before any
+        # search, LLM call or background add. Kept outside the try below so
+        # the fixed 403 is never wrapped as 404/500.
+        actor_user_id = self._resolve_actor(current_user, chat_req.user_id)
+        readable_cube_ids = chat_req.readable_cube_ids or [actor_user_id]
+        writable_cube_ids = chat_req.writable_cube_ids or [actor_user_id]
+        validated_cube_ids = list(readable_cube_ids)
+        if chat_req.add_message_on_answer:
+            validated_cube_ids.extend(writable_cube_ids)
+        self._require_cube_access(current_user, actor_user_id, validated_cube_ids)
+
+        try:
             # Step 1: Search for relevant memories
             search_req = APISearchRequest(
                 query=chat_req.query,
-                user_id=chat_req.user_id,
+                user_id=actor_user_id,
                 readable_cube_ids=readable_cube_ids,
                 mode=chat_req.mode,
                 internet_search=chat_req.internet_search,
@@ -202,13 +220,12 @@ class ChatHandler(BaseHandler):
                 f"[Cloud Service] Chat Complete LLM Input: {json.dumps(current_messages, ensure_ascii=False)} Chat Complete LLM Response: {response}"
             )
 
-            # Step 4: start add after chat asynchronously
+            # Step 4: start add after chat asynchronously (only with the
+            # already-validated writable cubes and actor)
             if chat_req.add_message_on_answer:
-                # Resolve writable cube IDs (for add)
-                writable_cube_ids = chat_req.writable_cube_ids or [chat_req.user_id]
                 start = time.time()
                 self._start_add_to_memory(
-                    user_id=chat_req.user_id,
+                    user_id=actor_user_id,
                     writable_cube_ids=writable_cube_ids,
                     session_id=chat_req.session_id or "default_session",
                     query=chat_req.query,
@@ -237,12 +254,17 @@ class ChatHandler(BaseHandler):
             self.logger.error(f"[Cloud Service] Failed to chat complete: {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(traceback.format_exc())) from err
 
-    def handle_chat_stream(self, chat_req: ChatRequest) -> StreamingResponse:
+    def handle_chat_stream(
+        self,
+        chat_req: ChatRequest,
+        current_user: "AuthContext | None" = None,
+    ) -> StreamingResponse:
         """
         Chat with MemOS via Server-Sent Events (SSE) stream for chat stream response.
 
         Args:
             chat_req: Chat stream request
+            current_user: Authenticated request identity from the router.
 
         Returns:
             StreamingResponse with SSE formatted chat stream
@@ -251,19 +273,32 @@ class ChatHandler(BaseHandler):
             HTTPException: If stream initialization fails
         """
         self.logger.info(f"[ChatHandler] Chat Req is: {chat_req}")
+
+        # Resolve the actor and validate the read+write cube union at the
+        # outermost level, before the generator and the StreamingResponse are
+        # constructed, so a denial surfaces as an initial HTTP 403 instead of
+        # an SSE error frame. The generator below only uses these validated
+        # lists and the actor.
+        actor_user_id = self._resolve_actor(current_user, chat_req.user_id)
+        readable_cube_ids = chat_req.readable_cube_ids or (
+            [chat_req.mem_cube_id] if chat_req.mem_cube_id else [actor_user_id]
+        )
+        writable_cube_ids = chat_req.writable_cube_ids or (
+            [chat_req.mem_cube_id] if chat_req.mem_cube_id else [actor_user_id]
+        )
+        validated_cube_ids = list(readable_cube_ids)
+        if chat_req.add_message_on_answer:
+            validated_cube_ids.extend(writable_cube_ids)
+        self._require_cube_access(current_user, actor_user_id, validated_cube_ids)
+
         try:
 
             def generate_chat_response() -> Generator[str, None, None]:
                 """Generate chat stream response as SSE stream."""
                 try:
-                    # Resolve readable cube IDs (for search)
-                    readable_cube_ids = chat_req.readable_cube_ids or (
-                        [chat_req.mem_cube_id] if chat_req.mem_cube_id else [chat_req.user_id]
-                    )
-
                     search_req = APISearchRequest(
                         query=chat_req.query,
-                        user_id=chat_req.user_id,
+                        user_id=actor_user_id,
                         readable_cube_ids=readable_cube_ids,
                         mode=chat_req.mode,
                         internet_search=chat_req.internet_search,
@@ -280,10 +315,10 @@ class ChatHandler(BaseHandler):
 
                     # Use first readable cube ID for scheduler (backward compatibility)
                     scheduler_cube_id = (
-                        readable_cube_ids[0] if readable_cube_ids else chat_req.user_id
+                        readable_cube_ids[0] if readable_cube_ids else actor_user_id
                     )
                     self._send_message_to_scheduler(
-                        user_id=chat_req.user_id,
+                        user_id=actor_user_id,
                         mem_cube_id=scheduler_cube_id,
                         query=chat_req.query,
                         label=QUERY_TASK_LABEL,
@@ -322,7 +357,7 @@ class ChatHandler(BaseHandler):
                     ]
 
                     self.logger.info(
-                        f"[Cloud Service] chat stream user_id: {chat_req.user_id}, readable_cube_ids: {readable_cube_ids}, "
+                        f"[Cloud Service] chat stream user_id: {actor_user_id}, readable_cube_ids: {readable_cube_ids}, "
                         f"current_system_prompt: {system_prompt}"
                     )
 
@@ -376,14 +411,12 @@ class ChatHandler(BaseHandler):
                     )
 
                     current_messages.append({"role": "assistant", "content": full_response})
+                    # Only the already-validated writable cubes and actor are
+                    # used for the background add.
                     if chat_req.add_message_on_answer:
-                        # Resolve writable cube IDs (for add)
-                        writable_cube_ids = chat_req.writable_cube_ids or (
-                            [chat_req.mem_cube_id] if chat_req.mem_cube_id else [chat_req.user_id]
-                        )
                         start = time.time()
                         self._start_add_to_memory(
-                            user_id=chat_req.user_id,
+                            user_id=actor_user_id,
                             writable_cube_ids=writable_cube_ids,
                             session_id=chat_req.session_id or "default_session",
                             query=chat_req.query,
