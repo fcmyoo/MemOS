@@ -274,7 +274,7 @@ LOGGING_CONFIG = {
             "class": "concurrent_log_handler.ConcurrentTimedRotatingFileHandler",
             "when": "midnight",
             "interval": 1,
-            "backupCount": 3,
+            "backupCount": int(os.getenv("LOG_BACKUP_DAYS", "14")),
             "filename": _setup_logfile(),
             "formatter": "standard",
             "filters": ["context_filter"],

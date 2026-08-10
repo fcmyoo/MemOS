@@ -67,9 +67,14 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         )
         set_request_context(context)
 
+        # Log only non-sensitive request metadata. Printing the full header
+        # dict would leak the Authorization bearer key into logs.
         logger.info(
-            f"Request started, source: {self.source}, method: {request.method}, path: {request.url.path}, "
-            f"headers: {request.headers}"
+            "Request started, source: %s, method: %s, path: %s, trace_id: %s",
+            self.source,
+            request.method,
+            request.url.path,
+            trace_id,
         )
 
         response = await call_next(request)

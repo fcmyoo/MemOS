@@ -55,21 +55,35 @@ def _get_client_key(request: Request) -> str:
     """
     Generate a unique key for rate limiting.
 
-    Uses API key if available, otherwise falls back to IP.
-    """
-    # Try to get API key from header
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("krlk_"):
-        # Use first 20 chars of key as identifier
-        return f"ratelimit:key:{auth_header[:20]}"
+    Uses a SHA-256 digest of the API key if available (never the plaintext
+    key or its readable prefix), otherwise falls back to IP.
 
-    # Fall back to IP address
+    X-Forwarded-For is only trusted when the request actually came through a
+    trusted proxy (X-Forwarded-For set by the proxy); when unset or when the
+    client connects directly, the socket peer address is used so an attacker
+    cannot forge the header to rotate rate-limit buckets.
+    """
+    import hashlib
+
+    # Try to get API key from header (accept both "Bearer krlk_..." and raw "krlk_...")
+    auth_header = request.headers.get("Authorization", "").strip()
+    raw_key = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else auth_header
+    if raw_key.startswith("krlk_"):
+        # Use a digest so no key material (even the prefix) is stored in
+        # Redis/memory or logs.
+        digest = hashlib.sha256(raw_key.encode()).hexdigest()[:24]
+        return f"ratelimit:key:{digest}"
+
+    # Fall back to IP address.
     client_ip = request.client.host if request.client else "unknown"
 
-    # Check for forwarded IP (behind proxy)
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
+    # Only honor X-Forwarded-For when this server sits behind a proxy that
+    # overwrites the header (configurable). If unset, direct clients cannot
+    # forge their rate-limit identity.
+    if os.getenv("TRUST_PROXY_HEADERS", "false").lower() == "true":
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
 
     return f"ratelimit:ip:{client_ip}"
 
