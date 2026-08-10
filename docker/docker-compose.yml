@@ -6,6 +6,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    restart: unless-stopped
     ports:
       - "${MEMOS_BIND_ADDRESS:-127.0.0.1}:8000:8000"
     env_file:
@@ -20,6 +21,8 @@ services:
     environment:
       - PYTHONPATH=/app/src
       - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
       - QDRANT_HOST=qdrant-docker
       - QDRANT_PORT=6333
       - NEO4J_URI=bolt://neo4j-docker:7687

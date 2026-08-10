@@ -1,9 +1,9 @@
 # MemOS with Krolik Security Extensions
 #
 # This Dockerfile builds MemOS with authentication, rate limiting, and admin API.
-# The extension entry point (memos.api.server_api_ext) and all security modules
-# live directly in the repository source tree (src/memos/); no overlay directory
-# is applied, so there is exactly one implementation to maintain.
+# All security modules live directly in the repository source tree (src/memos/);
+# the single canonical entry point is memos.api.server_api:app, where auth,
+# rate limiting, security headers and CORS are assembled.
 
 FROM python:3.11-slim
 
@@ -60,5 +60,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Use extended entry point with security features
-CMD ["gunicorn", "memos.api.server_api_ext:app", "--preload", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
+# Use the single canonical entry point; security features are assembled there.
+CMD ["gunicorn", "memos.api.server_api:app", "--preload", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]

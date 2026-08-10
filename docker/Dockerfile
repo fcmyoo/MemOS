@@ -31,5 +31,13 @@ ENV PYTHONPATH=/app/src
 # Expose port
 EXPOSE 8000
 
-# Start the docker
-CMD ["uvicorn", "memos.api.server_api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Run as non-root for production safety.
+# The source tree is mounted read-write for dev (compose volumes); the app
+# itself only needs read access, and the uvicorn worker runs as the app user.
+RUN useradd --create-home --uid 1000 memos \
+    && chown -R memos:memos /app
+USER memos
+
+# Start the server without --reload (production). Dev reload is enabled by
+# overriding the command in docker-compose or with `docker compose run`.
+CMD ["uvicorn", "memos.api.server_api:app", "--host", "0.0.0.0", "--port", "8000"]
