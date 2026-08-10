@@ -11,7 +11,7 @@ import traceback
 
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -32,7 +32,30 @@ from memos.mem_scheduler.optimized_scheduler import OptimizedScheduler
 from memos.mem_scheduler.utils.status_tracker import TaskStatusTracker
 
 
+if TYPE_CHECKING:
+    from memos.api.access_control import CubeAccessControl
+    from memos.api.middleware.auth import AuthContext
+
+
 logger = get_logger(__name__)
+
+
+def _resolve_actor(
+    current_user: "AuthContext | None",
+    access_control: "CubeAccessControl | None",
+    claimed_user_id: str | None,
+) -> str | None:
+    """
+    Resolve the effective actor through the shared CubeAccessControl gate.
+
+    Scheduler endpoints are user-scoped (no cube field), so the check stops at
+    identity consistency: a regular key may only operate on its own SQLite
+    user id. A missing auth context or gate (internal callers) keeps the
+    claimed user id unchanged, preserving pre-hardening semantics.
+    """
+    if current_user is None or access_control is None:
+        return claimed_user_id
+    return access_control.resolve_actor(current_user, claimed_user_id)
 
 
 def handle_scheduler_allstatus(
@@ -220,7 +243,11 @@ def handle_scheduler_allstatus(
 
 
 def handle_scheduler_status(
-    user_id: str, status_tracker: TaskStatusTracker, task_id: str | None = None
+    user_id: str,
+    status_tracker: TaskStatusTracker,
+    task_id: str | None = None,
+    current_user: "AuthContext | None" = None,
+    access_control: "CubeAccessControl | None" = None,
 ) -> StatusResponse:
     """
     Get scheduler running status for one or all tasks of a user.
@@ -233,6 +260,9 @@ def handle_scheduler_status(
         task_id: Optional Task ID to query. Can be either:
                  - business_task_id (will aggregate all related item statuses)
                  - item_id (will return single item status)
+        current_user: Authenticated request identity; enforced before any
+                 tracker access when provided.
+        access_control: Shared CubeAccessControl gate.
 
     Returns:
         StatusResponse with a list of task statuses.
@@ -240,6 +270,9 @@ def handle_scheduler_status(
     Raises:
         HTTPException: If a specific task is not found.
     """
+    # User-scope check before any tracker read; no cube field is involved.
+    user_id = _resolve_actor(current_user, access_control, user_id)
+
     response_data: list[StatusResponseItem] = []
 
     try:
@@ -279,8 +312,16 @@ def handle_scheduler_status(
 
 
 def handle_task_queue_status(
-    user_id: str, mem_scheduler: OptimizedScheduler, task_id: str | None = None
+    user_id: str,
+    mem_scheduler: OptimizedScheduler,
+    task_id: str | None = None,
+    current_user: "AuthContext | None" = None,
+    access_control: "CubeAccessControl | None" = None,
 ) -> TaskQueueResponse:
+    # User-scope check before touching stream keys / Redis, so a regular key
+    # can never enumerate or read another user's queue keys.
+    user_id = _resolve_actor(current_user, access_control, user_id)
+
     try:
         queue_wrapper = getattr(mem_scheduler, "memos_message_queue", None)
         if queue_wrapper is None:
@@ -377,6 +418,8 @@ def handle_scheduler_wait(
     status_tracker: TaskStatusTracker,
     timeout_seconds: float = 120.0,
     poll_interval: float = 0.5,
+    current_user: "AuthContext | None" = None,
+    access_control: "CubeAccessControl | None" = None,
 ) -> dict[str, Any]:
     """
     Wait until the scheduler is idle for a specific user.
@@ -385,10 +428,13 @@ def handle_scheduler_wait(
     'waiting' or 'in_progress' state, or until a timeout is reached.
 
     Args:
-        user_name: User name to wait for.
+        user_name: User name to wait for (treated as the claimed SQLite user id).
         status_tracker: The TaskStatusTracker instance.
         timeout_seconds: Maximum wait time in seconds.
         poll_interval: Polling interval in seconds.
+        current_user: Authenticated request identity; enforced before the
+                 polling loop when provided.
+        access_control: Shared CubeAccessControl gate.
 
     Returns:
         Dictionary with wait result and statistics.
@@ -396,6 +442,10 @@ def handle_scheduler_wait(
     Raises:
         HTTPException: If wait operation fails.
     """
+    # User-scope check before the polling loop; subsequent polling only uses
+    # the validated actor id.
+    user_name = _resolve_actor(current_user, access_control, user_name)
+
     start_time = time.time()
     try:
         while time.time() - start_time < timeout_seconds:
@@ -451,6 +501,8 @@ def handle_scheduler_wait_stream(
     timeout_seconds: float = 120.0,
     poll_interval: float = 0.5,
     instance_id: str = "",
+    current_user: "AuthContext | None" = None,
+    access_control: "CubeAccessControl | None" = None,
 ) -> StreamingResponse:
     """
     Stream scheduler progress via Server-Sent Events (SSE) using the new status endpoint.
@@ -459,15 +511,22 @@ def handle_scheduler_wait_stream(
     status frame indicating idle or timeout.
 
     Args:
-        user_name: User name to monitor.
+        user_name: User name to monitor (treated as the claimed SQLite user id).
         status_tracker: The TaskStatusTracker instance.
         timeout_seconds: Maximum stream duration in seconds.
         poll_interval: Polling interval between updates.
         instance_id: Instance ID for response.
+        current_user: Authenticated request identity; enforced before the
+                 stream is constructed when provided.
+        access_control: Shared CubeAccessControl gate.
 
     Returns:
         StreamingResponse with SSE formatted progress updates.
     """
+    # User-scope check at the outermost level, before the generator and the
+    # StreamingResponse exist, so a denial surfaces as an initial HTTP 403
+    # instead of being swallowed into an SSE error frame.
+    user_name = _resolve_actor(current_user, access_control, user_name)
 
     def event_generator():
         start_time = time.time()

@@ -3,6 +3,7 @@ Feeback handler for memory add/update functionality.
 """
 
 from memos.api.handlers.base_handler import BaseHandler, HandlerDependencies
+from memos.api.middleware.auth import AuthContext
 from memos.api.product_models import APIFeedbackRequest, MemoryResponse
 from memos.log import get_logger
 from memos.multi_mem_cube.composite_cube import CompositeCubeView
@@ -30,17 +31,25 @@ class FeedbackHandler(BaseHandler):
         super().__init__(dependencies)
         self._validate_dependencies("mem_reader", "mem_scheduler", "searcher", "reranker")
 
-    def handle_feedback_memories(self, feedback_req: APIFeedbackRequest) -> MemoryResponse:
+    def handle_feedback_memories(
+        self, feedback_req: APIFeedbackRequest, current_user: AuthContext | None = None
+    ) -> MemoryResponse:
         """
         Main handler for feedback memories endpoint.
 
         Args:
             feedback_req: feedback request containing content and parameters
+            current_user: Authenticated identity from the router.
 
         Returns:
             MemoryResponse with formatted results
         """
-        cube_view = self._build_cube_view(feedback_req)
+        # Actor -> cube validation before any side effect (plan 5.3 #11).
+        actor_user_id = self._resolve_actor(current_user, feedback_req.user_id)
+        cube_ids = self._resolve_cube_ids(feedback_req, actor_user_id)
+        self._require_cube_access(current_user, actor_user_id, cube_ids)
+
+        cube_view = self._build_cube_view(feedback_req, actor_user_id=actor_user_id)
 
         process_record = cube_view.feedback_memories(feedback_req)
 
@@ -51,17 +60,23 @@ class FeedbackHandler(BaseHandler):
             data=[process_record],
         )
 
-    def _resolve_cube_ids(self, feedback_req: APIFeedbackRequest) -> list[str]:
+    def _resolve_cube_ids(
+        self, feedback_req: APIFeedbackRequest, actor_user_id: str | None = None
+    ) -> list[str]:
         """
         Normalize target cube ids from feedback_req.
+
+        Falls back to the actor's own cube when no writable cubes are claimed.
         """
         if feedback_req.writable_cube_ids:
             return list(dict.fromkeys(feedback_req.writable_cube_ids))
 
-        return [feedback_req.user_id]
+        return [actor_user_id or feedback_req.user_id]
 
-    def _build_cube_view(self, feedback_req: APIFeedbackRequest) -> MemCubeView:
-        cube_ids = self._resolve_cube_ids(feedback_req)
+    def _build_cube_view(
+        self, feedback_req: APIFeedbackRequest, actor_user_id: str | None = None
+    ) -> MemCubeView:
+        cube_ids = self._resolve_cube_ids(feedback_req, actor_user_id)
 
         if len(cube_ids) == 1:
             cube_id = cube_ids[0]

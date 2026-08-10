@@ -14,6 +14,7 @@ from typing import Any
 
 from memos.api.handlers.base_handler import BaseHandler, HandlerDependencies
 from memos.api.handlers.formatters_handler import rerank_knowledge_mem
+from memos.api.middleware.auth import AuthContext
 from memos.api.product_models import APISearchRequest, SearchResponse
 from memos.dream.contextualization import CONTEXT_MEMORY_TYPE
 from memos.log import get_logger, summarize_search_request, summarize_search_results
@@ -66,7 +67,11 @@ class SearchHandler(BaseHandler):
         )
 
     @hookable("search")
-    def handle_search_memories(self, search_req: APISearchRequest) -> SearchResponse:
+    def handle_search_memories(
+        self,
+        search_req: APISearchRequest,
+        current_user: AuthContext | None = None,
+    ) -> SearchResponse:
         """
         Main handler for search memories endpoint.
 
@@ -75,10 +80,18 @@ class SearchHandler(BaseHandler):
 
         Args:
             search_req: Search request containing query and parameters
+            current_user: Authenticated identity published by the router;
+                when provided, the claimed user id and every target cube are
+                validated before any hook/search runs.
 
         Returns:
             SearchResponse with formatted results
         """
+        # Actor -> cube validation before any hook/search work (plan 5.3 #1).
+        actor_user_id = self._resolve_actor(current_user, search_req.user_id)
+        cube_ids = self._resolve_cube_ids(search_req, actor_user_id)
+        self._require_cube_access(current_user, actor_user_id, cube_ids)
+
         self.logger.info(
             "[SearchHandler] Search request summary: %s",
             summarize_search_request(search_req),
@@ -92,7 +105,7 @@ class SearchHandler(BaseHandler):
             search_req_local.top_k = search_req_local.top_k * 3
 
         # Search and deduplicate
-        cube_view = self._build_cube_view(search_req_local)
+        cube_view = self._build_cube_view(search_req_local, actor_user_id=actor_user_id)
         results = cube_view.search_memories(search_req_local)
         hooked_results = trigger_hook(
             H.SEARCH_MEMORY_RESULTS,
@@ -1024,20 +1037,27 @@ class SearchHandler(BaseHandler):
 
         return combined_score >= threshold
 
-    def _resolve_cube_ids(self, search_req: APISearchRequest) -> list[str]:
+    def _resolve_cube_ids(
+        self, search_req: APISearchRequest, actor_user_id: str | None = None
+    ) -> list[str]:
         """
         Normalize target cube ids from search_req.
         Priority:
         1) readable_cube_ids (deprecated mem_cube_id is converted to this in model validator)
-        2) fallback to user_id
+        2) fallback to the authenticated actor (claimed user_id when no auth context)
         """
         if search_req.readable_cube_ids:
             return list(dict.fromkeys(search_req.readable_cube_ids))
 
-        return [search_req.user_id]
+        return [actor_user_id or search_req.user_id]
 
-    def _build_cube_view(self, search_req: APISearchRequest, searcher=None) -> MemCubeView:
-        cube_ids = self._resolve_cube_ids(search_req)
+    def _build_cube_view(
+        self,
+        search_req: APISearchRequest,
+        searcher=None,
+        actor_user_id: str | None = None,
+    ) -> MemCubeView:
+        cube_ids = self._resolve_cube_ids(search_req, actor_user_id)
         searcher_to_use = searcher if searcher is not None else self.searcher
 
         if len(cube_ids) == 1:

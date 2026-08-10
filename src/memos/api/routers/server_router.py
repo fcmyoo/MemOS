@@ -15,15 +15,17 @@ import os
 import random as _random
 import socket
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from memos.api import handlers
+from memos.api.access_control import CubeAccessControl
 from memos.api.handlers.add_handler import AddHandler
 from memos.api.handlers.base_handler import HandlerDependencies
 from memos.api.handlers.chat_handler import ChatHandler
 from memos.api.handlers.cube_handler import CubeHandler
 from memos.api.handlers.feedback_handler import FeedbackHandler
 from memos.api.handlers.search_handler import SearchHandler
+from memos.api.middleware.auth import AuthContext, get_current_user
 from memos.api.product_models import (
     AllStatusResponse,
     APIADDRequest,
@@ -61,6 +63,7 @@ from memos.api.product_models import (
 from memos.log import get_logger
 from memos.mem_scheduler.base_scheduler import BaseScheduler
 from memos.mem_scheduler.utils.status_tracker import TaskStatusTracker
+from memos.mem_user.user_manager import UserManager
 
 
 logger = get_logger(__name__)
@@ -73,8 +76,15 @@ INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}:{_random.randint(1000, 9999
 # Initialize all server components
 components = handlers.init_server()
 
+# Shared user manager and access control: one authorization object per process
+# so every handler validates cube membership against the same database.
+user_manager = UserManager()
+access_control = CubeAccessControl(user_manager)
+
 # Create dependency container
-dependencies = HandlerDependencies.from_init_server(components)
+dependencies = HandlerDependencies.from_init_server(
+    {**components, "access_control": access_control}
+)
 
 # Initialize all handlers with dependency injection
 search_handler = SearchHandler(dependencies)
@@ -109,13 +119,16 @@ graph_db = components["graph_db"]
 
 
 @router.post("/search", summary="Search memories", response_model=SearchResponse)
-def search_memories(search_req: APISearchRequest):
+def search_memories(
+    search_req: APISearchRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """
     Search memories for a specific user.
 
     This endpoint uses the class-based SearchHandler for better code organization.
     """
-    search_results = search_handler.handle_search_memories(search_req)
+    search_results = search_handler.handle_search_memories(search_req, current_user)
     return search_results
 
 
@@ -125,13 +138,16 @@ def search_memories(search_req: APISearchRequest):
 
 
 @router.post("/add", summary="Add memories", response_model=MemoryResponse)
-def add_memories(add_req: APIADDRequest):
+def add_memories(
+    add_req: APIADDRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """
     Add memories for a specific user.
 
     This endpoint uses the class-based AddHandler for better code organization.
     """
-    return add_handler.handle_add_memories(add_req)
+    return add_handler.handle_add_memories(add_req, current_user)
 
 
 # =============================================================================
@@ -140,7 +156,10 @@ def add_memories(add_req: APIADDRequest):
 
 
 @router.post("/create_cube", summary="Create a new memory cube", response_model=CreateCubeResponse)
-async def create_cube(request: CreateCubeRequest) -> CreateCubeResponse:
+async def create_cube(
+    request: CreateCubeRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+) -> CreateCubeResponse:
     """
     Create a new memory cube for a user.
 
@@ -159,7 +178,7 @@ async def create_cube(request: CreateCubeRequest) -> CreateCubeResponse:
     - **readable_cube_ids**: List of cube IDs the user can read from (used in search/chat)
     - **writable_cube_ids**: List of cube IDs the user can write to (used in add/chat)
     """
-    return await cube_handler.create_cube(request)
+    return await cube_handler.create_cube(request, current_user)
 
 
 @router.post(
@@ -167,7 +186,10 @@ async def create_cube(request: CreateCubeRequest) -> CreateCubeResponse:
     summary="Register an existing memory cube",
     response_model=RegisterCubeResponse,
 )
-async def register_cube(request: RegisterCubeRequest) -> RegisterCubeResponse:
+async def register_cube(
+    request: RegisterCubeRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+) -> RegisterCubeResponse:
     """
     Register an existing memory cube with the MOS system.
 
@@ -182,7 +204,7 @@ async def register_cube(request: RegisterCubeRequest) -> RegisterCubeResponse:
     This endpoint validates the registration request. Full registration functionality
     requires architectural integration with MOSCore, which will be completed in a future update.
     """
-    return await cube_handler.register_cube(request)
+    return await cube_handler.register_cube(request, current_user)
 
 
 # =============================================================================
@@ -208,12 +230,15 @@ def scheduler_allstatus():
 def scheduler_status(
     user_id: str = Query(..., description="User ID"),
     task_id: str | None = Query(None, description="Optional Task ID to query a specific task"),
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
 ):
     """Get scheduler running status."""
     return handlers.scheduler_handler.handle_scheduler_status(
         user_id=user_id,
         task_id=task_id,
         status_tracker=status_tracker,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
@@ -224,10 +249,14 @@ def scheduler_status(
 )
 def scheduler_task_queue_status(
     user_id: str = Query(..., description="User ID whose queue status is requested"),
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
 ):
     """Get scheduler task queue backlog/pending status for a user."""
     return handlers.scheduler_handler.handle_task_queue_status(
-        user_id=user_id, mem_scheduler=mem_scheduler
+        user_id=user_id,
+        mem_scheduler=mem_scheduler,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
@@ -236,6 +265,7 @@ def scheduler_wait(
     user_name: str,
     timeout_seconds: float = 120.0,
     poll_interval: float = 0.5,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
 ):
     """Wait until scheduler is idle for a specific user."""
     return handlers.scheduler_handler.handle_scheduler_wait(
@@ -243,6 +273,8 @@ def scheduler_wait(
         status_tracker=status_tracker,
         timeout_seconds=timeout_seconds,
         poll_interval=poll_interval,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
@@ -251,6 +283,7 @@ def scheduler_wait_stream(
     user_name: str,
     timeout_seconds: float = 120.0,
     poll_interval: float = 0.5,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
 ):
     """Stream scheduler progress via Server-Sent Events (SSE)."""
     return handlers.scheduler_handler.handle_scheduler_wait_stream(
@@ -259,6 +292,8 @@ def scheduler_wait_stream(
         timeout_seconds=timeout_seconds,
         poll_interval=poll_interval,
         instance_id=INSTANCE_ID,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
@@ -268,7 +303,10 @@ def scheduler_wait_stream(
 
 
 @router.post("/chat/complete", summary="Chat with MemOS (Complete Response)")
-def chat_complete(chat_req: APIChatCompleteRequest):
+def chat_complete(
+    chat_req: APIChatCompleteRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """
     Chat with MemOS for a specific user. Returns complete response (non-streaming).
 
@@ -278,11 +316,14 @@ def chat_complete(chat_req: APIChatCompleteRequest):
         raise HTTPException(
             status_code=503, detail="Chat service is not available. Chat handler not initialized."
         )
-    return chat_handler.handle_chat_complete(chat_req)
+    return chat_handler.handle_chat_complete(chat_req, current_user)
 
 
 @router.post("/chat/stream", summary="Chat with MemOS")
-def chat_stream(chat_req: ChatRequest):
+def chat_stream(
+    chat_req: ChatRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """
     Chat with MemOS for a specific user. Returns SSE stream.
 
@@ -293,7 +334,7 @@ def chat_stream(chat_req: ChatRequest):
         raise HTTPException(
             status_code=503, detail="Chat service is not available. Chat handler not initialized."
         )
-    return chat_handler.handle_chat_stream(chat_req)
+    return chat_handler.handle_chat_stream(chat_req, current_user)
 
 
 @router.post("/chat/stream/playground", summary="Chat with MemOS playground")
@@ -321,14 +362,20 @@ def chat_stream_playground(chat_req: ChatPlaygroundRequest):
     summary="Get suggestion queries",
     response_model=SuggestionResponse,
 )
-def get_suggestion_queries(suggestion_req: SuggestionRequest):
+def get_suggestion_queries(
+    suggestion_req: SuggestionRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """Get suggestion queries for a specific user with language preference."""
     return handlers.suggestion_handler.handle_get_suggestion_queries(
-        user_id=suggestion_req.mem_cube_id,
+        user_id=suggestion_req.user_id,
         language=suggestion_req.language,
         message=suggestion_req.message,
         llm=llm,
         naive_mem_cube=naive_mem_cube,
+        cube_id=suggestion_req.mem_cube_id,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
@@ -338,7 +385,10 @@ def get_suggestion_queries(suggestion_req: SuggestionRequest):
 
 
 @router.post("/get_all", summary="Get all memories for user", response_model=MemoryResponse)
-def get_all_memories(memory_req: GetMemoryPlaygroundRequest):
+def get_all_memories(
+    memory_req: GetMemoryPlaygroundRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """
     Get all memories or subgraph for a specific user.
 
@@ -355,6 +405,8 @@ def get_all_memories(memory_req: GetMemoryPlaygroundRequest):
             top_k=200,
             naive_mem_cube=naive_mem_cube,
             search_type=memory_req.search_type,
+            current_user=current_user,
+            access_control=access_control,
         )
     else:
         return handlers.memory_handler.handle_get_all_memories(
@@ -364,14 +416,21 @@ def get_all_memories(memory_req: GetMemoryPlaygroundRequest):
             ),
             memory_type=memory_req.memory_type or "text_mem",
             naive_mem_cube=naive_mem_cube,
+            current_user=current_user,
+            access_control=access_control,
         )
 
 
 @router.post("/get_memory", summary="Get memories for user", response_model=GetMemoryResponse)
-def get_memories(memory_req: GetMemoryRequest):
+def get_memories(
+    memory_req: GetMemoryRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     return handlers.memory_handler.handle_get_memories(
         get_mem_req=memory_req,
         naive_mem_cube=naive_mem_cube,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
@@ -384,19 +443,30 @@ def get_memory_by_id(memory_id: str):
 
 
 @router.post("/get_memory_by_ids", summary="Get memory by ids", response_model=GetMemoryResponse)
-def get_memory_by_ids(memory_ids: list[str]):
+def get_memory_by_ids(
+    memory_ids: list[str],
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     return handlers.memory_handler.handle_get_memory_by_ids(
         memory_ids=memory_ids,
         naive_mem_cube=naive_mem_cube,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
 @router.post(
     "/delete_memory", summary="Delete memories for user", response_model=DeleteMemoryResponse
 )
-def delete_memories(memory_req: DeleteMemoryRequest):
+def delete_memories(
+    memory_req: DeleteMemoryRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     return handlers.memory_handler.handle_delete_memories(
-        delete_mem_req=memory_req, naive_mem_cube=naive_mem_cube
+        delete_mem_req=memory_req,
+        naive_mem_cube=naive_mem_cube,
+        current_user=current_user,
+        access_control=access_control,
     )
 
 
@@ -406,13 +476,16 @@ def delete_memories(memory_req: DeleteMemoryRequest):
 
 
 @router.post("/feedback", summary="Feedback memories", response_model=MemoryResponse)
-def feedback_memories(feedback_req: APIFeedbackRequest):
+def feedback_memories(
+    feedback_req: APIFeedbackRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """
     Feedback memories for a specific user.
 
     This endpoint uses the class-based FeedbackHandler for better code organization.
     """
-    return feedback_handler.handle_feedback_memories(feedback_req)
+    return feedback_handler.handle_feedback_memories(feedback_req, current_user)
 
 
 # =============================================================================
@@ -466,8 +539,16 @@ def chat_stream_business_user(chat_req: ChatBusinessRequest):
     summary="Delete memory by record id",
     response_model=DeleteMemoryByRecordIdResponse,
 )
-def delete_memory_by_record_id(memory_req: DeleteMemoryByRecordIdRequest):
+def delete_memory_by_record_id(
+    memory_req: DeleteMemoryByRecordIdRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """(inner) Delete memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
+    # Actor -> cube validation before the graph delete (plan 5.3 #9).
+    actor_user_id = access_control.resolve_actor(current_user, None)
+    access_control.require_cube_access(
+        current_user, actor_user_id, [memory_req.mem_cube_id]
+    )
     graph_db.delete_node_by_mem_cube_id(
         mem_cube_id=memory_req.mem_cube_id,
         delete_record_id=memory_req.record_id,
@@ -486,8 +567,16 @@ def delete_memory_by_record_id(memory_req: DeleteMemoryByRecordIdRequest):
     summary="Recover memory by record id",
     response_model=RecoverMemoryByRecordIdResponse,
 )
-def recover_memory_by_record_id(memory_req: RecoverMemoryByRecordIdRequest):
+def recover_memory_by_record_id(
+    memory_req: RecoverMemoryByRecordIdRequest,
+    current_user: AuthContext = Depends(get_current_user),  # noqa: B008
+):
     """(inner) Recover memory nodes by mem_cube_id (user_name) and delete_record_id. Record id is inner field, just for delete and recover memory, not for user to set."""
+    # Actor -> cube validation before the graph recover (plan 5.3 #10).
+    actor_user_id = access_control.resolve_actor(current_user, None)
+    access_control.require_cube_access(
+        current_user, actor_user_id, [memory_req.mem_cube_id]
+    )
     graph_db.recover_memory_by_mem_cube_id(
         mem_cube_id=memory_req.mem_cube_id,
         delete_record_id=memory_req.delete_record_id,

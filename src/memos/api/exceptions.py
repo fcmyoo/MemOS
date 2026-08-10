@@ -64,3 +64,14 @@ class APIExceptionHandler:
             status_code=exc.status_code,
             content={"code": exc.status_code, "message": str(exc.detail), "data": None},
         )
+
+    @staticmethod
+    async def access_forbidden_handler(request: Request, exc):
+        """Handle cube access denials with the standard FastAPI body.
+
+        Authorization failures keep ``{"detail": "Insufficient cube access"}``
+        so clients can distinguish them from generic wrapped HTTP errors.
+        """
+        from memos.api.access_control import FORBIDDEN_DETAIL
+
+        return JSONResponse(status_code=403, content={"detail": FORBIDDEN_DETAIL})

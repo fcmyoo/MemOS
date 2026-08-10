@@ -7,6 +7,7 @@ This module handles cube creation and registration through the HTTP API.
 from fastapi import HTTPException
 
 from memos.api.handlers.base_handler import BaseHandler
+from memos.api.middleware.auth import AuthContext
 from memos.api.product_models import (
     CreateCubeRequest,
     CreateCubeResponse,
@@ -32,18 +33,32 @@ class CubeHandler(BaseHandler):
         # Use graph_db as the backend for user/cube management
         self.user_manager = UserManager()
 
-    async def create_cube(self, request: CreateCubeRequest) -> CreateCubeResponse:
+    async def create_cube(
+        self, request: CreateCubeRequest, current_user: AuthContext | None = None
+    ) -> CreateCubeResponse:
         """Create a new memory cube for a user.
 
         Args:
             request: Cube creation request
+            current_user: Authenticated identity from the router.
 
         Returns:
             CreateCubeResponse with created cube details
 
         Raises:
-            HTTPException: If cube creation fails
+            HTTPException: If cube creation fails or the actor is unauthorized.
         """
+        # Actor validation before any side effect (plan 5.3 #3).
+        # resolve_actor rejects forged owner ids for regular keys with the
+        # uniform 403; privileged keys keep the legacy owner-existence 400
+        # semantics. HTTPException must not fall into the generic except below,
+        # so the access check lives before the try block.
+        actor_user_id = self._resolve_actor(current_user, request.owner_id)
+        if current_user is not None and not self.access_control.is_privileged(current_user):
+            # Regular keys may only create cubes for themselves.
+            if actor_user_id != request.owner_id:
+                self.access_control._deny()
+
         try:
             # Validate owner exists
             if not self.user_manager.validate_user(request.owner_id):
@@ -69,6 +84,8 @@ class CubeHandler(BaseHandler):
                 ),
             )
 
+        except HTTPException:
+            raise
         except ValueError as e:
             logger.error(f"Validation error creating cube: {e}")
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -76,7 +93,9 @@ class CubeHandler(BaseHandler):
             logger.error(f"Failed to create cube: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to create cube: {e!s}") from e
 
-    async def register_cube(self, request: RegisterCubeRequest) -> RegisterCubeResponse:
+    async def register_cube(
+        self, request: RegisterCubeRequest, current_user: AuthContext | None = None
+    ) -> RegisterCubeResponse:
         """Register an existing memory cube with the system.
 
         Note: This endpoint currently validates the request but the actual registration
@@ -86,13 +105,24 @@ class CubeHandler(BaseHandler):
 
         Args:
             request: Cube registration request
+            current_user: Authenticated identity from the router.
 
         Returns:
             RegisterCubeResponse with registration details
 
         Raises:
-            HTTPException: If registration fails
+            HTTPException: If registration fails or the actor is unauthorized
         """
+        # Actor -> cube validation before any side effect (plan 5.3 #4).
+        # Unknown and unauthorized cubes are both the uniform 403 in auth mode;
+        # the placeholder 200/400 behavior is kept when auth is disabled.
+        final_cube_id = request.mem_cube_id or request.mem_cube_name_or_path
+        if current_user is not None and not self.access_control.is_bypassed(current_user):
+            actor_user_id = self._resolve_actor(current_user, request.user_id)
+            self.access_control.require_cube_access(
+                current_user, actor_user_id, [final_cube_id] if final_cube_id else []
+            )
+
         try:
             # Validate user exists if provided
             if request.user_id and not self.user_manager.validate_user(request.user_id):
@@ -120,6 +150,8 @@ class CubeHandler(BaseHandler):
                 ),
             )
 
+        except HTTPException:
+            raise
         except ValueError as e:
             logger.error(f"Validation error registering cube: {e}")
             raise HTTPException(status_code=400, detail=str(e)) from e

@@ -8,6 +8,7 @@ using dependency injection for better modularity and testability.
 from pydantic import validate_call
 
 from memos.api.handlers.base_handler import BaseHandler, HandlerDependencies
+from memos.api.middleware.auth import AuthContext
 from memos.api.product_models import APIADDRequest, APIFeedbackRequest, MemoryResponse
 from memos.memories.textual.item import (
     list_all_fields,
@@ -39,7 +40,11 @@ class AddHandler(BaseHandler):
         )
 
     @hookable("add")
-    def handle_add_memories(self, add_req: APIADDRequest) -> MemoryResponse:
+    def handle_add_memories(
+        self,
+        add_req: APIADDRequest,
+        current_user: AuthContext | None = None,
+    ) -> MemoryResponse:
         """
         Main handler for add memories endpoint.
 
@@ -48,10 +53,18 @@ class AddHandler(BaseHandler):
 
         Args:
             add_req: Add memory request (deprecated fields are converted in model validator)
+            current_user: Authenticated identity published by the router;
+                when provided, the claimed user id and every target cube are
+                validated before any logging/build/scheduler enqueue.
 
         Returns:
             MemoryResponse with added memory information
         """
+        # Actor -> cube validation before any side effect (plan 5.3 #2).
+        actor_user_id = self._resolve_actor(current_user, add_req.user_id)
+        cube_ids = self._resolve_cube_ids(add_req, actor_user_id)
+        self._require_cube_access(current_user, actor_user_id, cube_ids)
+
         self.logger.info(
             f"[DIAGNOSTIC] server_router -> add_handler.handle_add_memories called (Modified at 2025-11-29 18:46). Full request: {add_req.model_dump_json(indent=2)}"
         )
@@ -63,7 +76,7 @@ class AddHandler(BaseHandler):
             if len(add_req.info) < info_len:
                 self.logger.warning(f"[AddHandler] info fields can not contain {exclude_fields}.")
 
-        cube_view = self._build_cube_view(add_req)
+        cube_view = self._build_cube_view(add_req, actor_user_id=actor_user_id)
 
         @validate_call
         def _check_messages(messages: MessageList) -> None:
@@ -115,20 +128,22 @@ class AddHandler(BaseHandler):
             data=results,
         )
 
-    def _resolve_cube_ids(self, add_req: APIADDRequest) -> list[str]:
+    def _resolve_cube_ids(
+        self, add_req: APIADDRequest, actor_user_id: str | None = None
+    ) -> list[str]:
         """
         Normalize target cube ids from add_req.
         Priority:
         1) writable_cube_ids (deprecated mem_cube_id is converted to this in model validator)
-        2) fallback to user_id
+        2) fallback to actor user id (claimed user id when unauthenticated)
         """
         if add_req.writable_cube_ids:
             return list(dict.fromkeys(add_req.writable_cube_ids))
 
-        return [add_req.user_id]
+        return [actor_user_id or add_req.user_id]
 
-    def _build_cube_view(self, add_req: APIADDRequest) -> MemCubeView:
-        cube_ids = self._resolve_cube_ids(add_req)
+    def _build_cube_view(self, add_req: APIADDRequest, actor_user_id: str | None = None) -> MemCubeView:
+        cube_ids = self._resolve_cube_ids(add_req, actor_user_id)
 
         if len(cube_ids) == 1:
             cube_id = cube_ids[0]

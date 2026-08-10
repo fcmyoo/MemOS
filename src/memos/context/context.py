@@ -100,6 +100,14 @@ def set_request_context(context: RequestContext | None) -> None:
         _request_context.set(None)
 
 
+def set_current_user_name(user_name: str | None) -> None:
+    """Replace the authenticated user without dropping other request context fields."""
+    context = _request_context.get()
+    if context is None:
+        return
+    _request_context.set({**context, "user_name": user_name})
+
+
 def get_current_trace_id() -> str | None:
     """
     Get the current request's trace_id.

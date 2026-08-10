@@ -9,6 +9,7 @@ import json
 
 from typing import Any
 
+from memos.api.middleware.auth import AuthContext
 from memos.api.product_models import SuggestionResponse
 from memos.log import get_logger
 from memos.mem_os.utils.format_utils import clean_json_response
@@ -71,6 +72,9 @@ def handle_get_suggestion_queries(
     message: MessagesType | None,
     llm: Any,
     naive_mem_cube: Any,
+    cube_id: str | None = None,
+    current_user: AuthContext | None = None,
+    access_control: Any = None,
 ) -> SuggestionResponse:
     """
     Main handler for suggestion queries endpoint.
@@ -83,10 +87,22 @@ def handle_get_suggestion_queries(
         message: Optional chat message list for further suggestions
         llm: LLM instance
         naive_mem_cube: Memory cube instance
+        cube_id: Optional memory cube id (suggestion_req.mem_cube_id)
+        current_user: Authenticated identity from the router.
+        access_control: Shared CubeAccessControl instance.
 
     Returns:
         SuggestionResponse with generated queries
     """
+    # Actor -> cube validation before any side effect (plan 5.3 #12).
+    # The router previously passed mem_cube_id as user_id; keep both inputs
+    # explicit and resolve the actor before searching the cube.
+    target_cube = cube_id or user_id
+    if current_user is not None and access_control is not None:
+        actor_user_id = access_control.resolve_actor(current_user, user_id)
+        access_control.require_cube_access(current_user, actor_user_id, [target_cube])
+        user_id = actor_user_id
+
     try:
         # If message is provided, get further suggestions based on dialogue
         if message:
@@ -102,13 +118,13 @@ def handle_get_suggestion_queries(
         else:  # English
             suggestion_prompt = SUGGESTION_QUERY_PROMPT_EN
 
-        # Search for recent memories
+        # Search for recent memories (scoped by cube, not the raw user id)
         text_mem_results = naive_mem_cube.text_mem.search(
             query="my recently memories",
-            user_name=user_id,
+            user_name=target_cube,
             top_k=3,
             mode="fast",
-            info={"user_id": user_id},
+            info={"user_id": target_cube},
         )
 
         # Extract memory content

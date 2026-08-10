@@ -5,11 +5,16 @@ This module provides the base class for all API handlers, implementing
 dependency injection and common functionality.
 """
 
-from typing import Any
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 from memos.log import get_logger
 from memos.mem_scheduler.optimized_scheduler import OptimizedScheduler
 from memos.memories.textual.tree_text_memory.retrieve.advanced_searcher import AdvancedSearcher
+
+
+if TYPE_CHECKING:
+    from memos.api.middleware.auth import AuthContext
 
 
 logger = get_logger(__name__)
@@ -164,6 +169,42 @@ class BaseHandler:
     def feedback_server(self):
         """Get feedback server instance."""
         return self.deps.feedback_server
+
+    @property
+    def access_control(self):
+        """Get the shared CubeAccessControl instance."""
+        return self.deps.access_control
+
+    def _resolve_actor(
+        self, current_user: "AuthContext | None", claimed_user_id: str | None
+    ) -> str | None:
+        """
+        Resolve the effective actor user id for this request.
+
+        A missing auth context (``current_user is None``) marks an internal
+        composition path (e.g. ChatHandler reusing this handler) that is not
+        authenticated at this layer; the claimed user id is kept as-is there,
+        preserving pre-hardening semantics.
+        """
+        if current_user is None:
+            return claimed_user_id
+        return self.access_control.resolve_actor(current_user, claimed_user_id)
+
+    def _require_cube_access(
+        self,
+        current_user: "AuthContext | None",
+        actor_user_id: str | None,
+        cube_ids: Iterable[str],
+    ) -> None:
+        """
+        Enforce cube access through the shared CubeAccessControl gate.
+
+        Skipped when no auth context is available (internal composition
+        paths); the router-facing entry points always provide one.
+        """
+        if current_user is None:
+            return
+        self.access_control.require_cube_access(current_user, actor_user_id, cube_ids)
 
     def _validate_dependencies(self, *required_deps: str) -> None:
         """

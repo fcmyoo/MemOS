@@ -10,7 +10,7 @@ import hmac
 import os
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, Request, Security
@@ -18,17 +18,37 @@ from fastapi.security import APIKeyHeader
 
 import memos.log
 
+from memos.context.context import set_current_user_name
+
 
 logger = memos.log.get_logger(__name__)
+
+
+class AuthContext(TypedDict, total=False):
+    """Authenticated request identity published by verify_api_key()."""
+
+    user_name: str
+    scopes: list[str]
+    is_master_key: bool
+    auth_bypassed: bool
+    is_internal: bool
+    api_key_id: str
+
+
+def _publish_authenticated_user(request: Request, auth: AuthContext) -> AuthContext:
+    request.state.auth = auth
+    request.state.user = auth["user_name"]
+    set_current_user_name(auth["user_name"])
+    return auth
 
 # API key header configuration
 API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 
-# Load .env before the environment-derived constants below: both server entry
-# points import verify_api_key at module import time, so relying on a later
-# load_dotenv() (server_api.py) or none at all (server_api_ext.py) would leave
-# AUTH_ENABLED / MASTER_KEY_HASH / INTERNAL_SERVICE_SECRET stale. Process
-# environment variables still take precedence over .env values.
+# Load .env before the environment-derived constants below: the server entry
+# point imports verify_api_key at module import time, so relying on a later
+# load_dotenv() would leave AUTH_ENABLED / MASTER_KEY_HASH /
+# INTERNAL_SERVICE_SECRET stale. Process environment variables still take
+# precedence over .env values.
 load_dotenv()
 
 # Environment configuration
@@ -172,7 +192,7 @@ def is_internal_request(request: Request) -> bool:
 async def verify_api_key(
     request: Request,
     api_key: str | None = Security(API_KEY_HEADER),
-) -> dict[str, Any]:
+) -> AuthContext:
     """
     Verify API key and return user context.
 
@@ -186,12 +206,15 @@ async def verify_api_key(
     """
     # Skip auth if disabled
     if not AUTH_ENABLED:
-        return {
-            "user_name": request.headers.get("X-User-Name", "default"),
-            "scopes": ["all"],
-            "is_master_key": False,
-            "auth_bypassed": True,
-        }
+        return _publish_authenticated_user(
+            request,
+            {
+                "user_name": request.headers.get("X-User-Name", "default"),
+                "scopes": ["all"],
+                "is_master_key": False,
+                "auth_bypassed": True,
+            },
+        )
 
     # Allow internal services
     if is_internal_request(request):
@@ -199,12 +222,15 @@ async def verify_api_key(
             "Internal request from %s",
             request.client.host if request.client else "unknown",
         )
-        return {
-            "user_name": "internal",
-            "scopes": ["all"],
-            "is_master_key": False,
-            "is_internal": True,
-        }
+        return _publish_authenticated_user(
+            request,
+            {
+                "user_name": "internal",
+                "scopes": ["all"],
+                "is_master_key": False,
+                "is_internal": True,
+            },
+        )
 
     # Require API key
     if not api_key:
@@ -224,11 +250,14 @@ async def verify_api_key(
     key_hash = hash_api_key(api_key)
     if MASTER_KEY_HASH and key_hash == MASTER_KEY_HASH:
         logger.info("Master key authentication")
-        return {
-            "user_name": "admin",
-            "scopes": ["all"],
-            "is_master_key": True,
-        }
+        return _publish_authenticated_user(
+            request,
+            {
+                "user_name": "admin",
+                "scopes": ["all"],
+                "is_master_key": True,
+            },
+        )
 
     # Validate format for regular API keys (krlk_*)
     if not validate_key_format(api_key):
@@ -247,12 +276,27 @@ async def verify_api_key(
         )
 
     logger.debug("Authenticated user: %s", key_data["user_name"])
-    return {
-        "user_name": key_data["user_name"],
-        "scopes": key_data["scopes"],
-        "is_master_key": False,
-        "api_key_id": key_data["id"],
-    }
+    return _publish_authenticated_user(
+        request,
+        {
+            "user_name": key_data["user_name"],
+            "scopes": key_data["scopes"],
+            "is_master_key": False,
+            "api_key_id": key_data["id"],
+        },
+    )
+
+
+async def get_current_user(
+    request: Request,
+    auth: AuthContext = Depends(verify_api_key),  # noqa: B008
+) -> AuthContext:
+    """Dependency exposing the authenticated identity to endpoints.
+
+    Re-publishes so app.dependency_overrides[verify_api_key] has identical
+    side effects (request.state + request context) as the real dependency.
+    """
+    return _publish_authenticated_user(request, auth)
 
 
 def require_scope(required_scope: str):

@@ -6,6 +6,9 @@ This module handles retrieving all memories or specific subgraphs based on queri
 
 from typing import Any, Literal
 
+from fastapi import HTTPException
+
+from memos.api.middleware.auth import AuthContext
 from memos.api.product_models import (
     DeleteMemoryRequest,
     DeleteMemoryResponse,
@@ -28,11 +31,61 @@ from memos.mem_os.utils.format_utils import (
 logger = get_logger(__name__)
 
 
+def _require_cube_access_for(
+    current_user: AuthContext | None,
+    access_control: Any,
+    actor_user_id: str | None,
+    cube_ids: list[str],
+) -> None:
+    """Enforce cube access through the shared gate when authenticated.
+
+    Bypassed requests (AUTH_ENABLED=false) and internal composition paths
+    (current_user is None) keep legacy semantics.
+    """
+    if current_user is None or access_control is None:
+        return
+    access_control.require_cube_access(current_user, actor_user_id, cube_ids)
+
+
+def _resolve_actor_for(
+    access_control: Any, current_user: AuthContext | None, claimed_user_id: str | None
+) -> str | None:
+    """Resolve the effective actor user id (legacy semantics when unauthenticated)."""
+    if current_user is None or access_control is None:
+        return claimed_user_id
+    return access_control.resolve_actor(current_user, claimed_user_id)
+
+
+def _cube_ids_from_memories(memories: list[Any], requested_ids: list[str]) -> list[str]:
+    """Extract cube ids from memory metadata (plan 5.4 all-or-nothing rule).
+
+    Any returned item missing cube metadata, or a request whose returned item
+    count does not match the requested id count, raises the uniform 403 before
+    any partial read/delete can be observed.
+    """
+    from memos.api.access_control import AccessForbiddenError
+
+    if len(memories) != len(set(requested_ids)):
+        raise AccessForbiddenError()
+    cube_ids: list[str] = []
+    for memory in memories:
+        metadata = memory.metadata if hasattr(memory, "metadata") else memory.get("metadata", {})
+        cube_id = (
+            metadata.user_name if hasattr(metadata, "user_name") else metadata.get("user_name")
+        )
+        if not cube_id:
+            raise AccessForbiddenError()
+        cube_ids.append(cube_id)
+    return list(dict.fromkeys(cube_ids))
+
+
 def handle_get_all_memories(
     user_id: str,
     mem_cube_id: str,
     memory_type: Literal["text_mem", "act_mem", "param_mem", "para_mem"],
     naive_mem_cube: Any,
+    current_user: AuthContext | None = None,
+    access_control: Any = None,
 ) -> MemoryResponse:
     """
     Main handler for getting all memories.
@@ -48,6 +101,14 @@ def handle_get_all_memories(
     Returns:
         MemoryResponse with formatted memory data
     """
+    # Actor -> cube validation before any read (plan 5.3 #5).
+    if current_user is not None and access_control is not None:
+        actor_user_id = _resolve_actor_for(access_control, current_user, user_id)
+        _require_cube_access_for(
+            current_user, access_control, actor_user_id, [mem_cube_id] if mem_cube_id else []
+        )
+        user_id = actor_user_id
+
     try:
         reformat_memory_list = []
 
@@ -102,6 +163,8 @@ def handle_get_subgraph(
     top_k: int,
     naive_mem_cube: Any,
     search_type: Literal["embedding", "fulltext"],
+    current_user: AuthContext | None = None,
+    access_control: Any = None,
 ) -> MemoryResponse:
     """
     Main handler for getting memory subgraph based on query.
@@ -118,6 +181,14 @@ def handle_get_subgraph(
     Returns:
         MemoryResponse with formatted subgraph data
     """
+    # Actor -> cube validation before any read (plan 5.3 #5).
+    if current_user is not None and access_control is not None:
+        actor_user_id = _resolve_actor_for(access_control, current_user, user_id)
+        _require_cube_access_for(
+            current_user, access_control, actor_user_id, [mem_cube_id] if mem_cube_id else []
+        )
+        user_id = actor_user_id
+
     try:
         # Get relevant subgraph from text memory
         memories = naive_mem_cube.text_mem.get_relevant_subgraph(
@@ -192,7 +263,10 @@ def handle_get_memory(memory_id: str, naive_mem_cube: NaiveMemCube) -> GetMemory
 
 
 def handle_get_memory_by_ids(
-    memory_ids: list[str], naive_mem_cube: NaiveMemCube
+    memory_ids: list[str],
+    naive_mem_cube: NaiveMemCube,
+    current_user: AuthContext | None = None,
+    access_control: Any = None,
 ) -> GetMemoryResponse:
     """
     Handler for getting multiple memories by their IDs.
@@ -210,14 +284,41 @@ def handle_get_memory_by_ids(
     if memories is None:
         memories = []
 
+    # Actor -> cube validation before any result is serialized (plan 5.3 #7 /
+    # 5.4 all-or-nothing). Missing metadata or mixed cubes raise the uniform 403
+    # and no partial result is returned. Bypassed requests (AUTH_ENABLED=false)
+    # keep legacy behavior and are not subject to the metadata reverse-lookup.
+    if (
+        current_user is not None
+        and access_control is not None
+        and memory_ids
+        and not access_control.is_bypassed(current_user)
+    ):
+        cube_ids = _cube_ids_from_memories(list(memories), list(memory_ids))
+        actor_user_id = _resolve_actor_for(access_control, current_user, None)
+        _require_cube_access_for(current_user, access_control, actor_user_id, cube_ids)
+
     return GetMemoryResponse(
         message="Memories retrieved successfully", code=200, data={"memories": memories}
     )
 
 
 def handle_get_memories(
-    get_mem_req: GetMemoryRequest, naive_mem_cube: NaiveMemCube
+    get_mem_req: GetMemoryRequest,
+    naive_mem_cube: NaiveMemCube,
+    current_user: AuthContext | None = None,
+    access_control: Any = None,
 ) -> GetMemoryResponse:
+    # Actor -> cube validation before any read (plan 5.3 #6).
+    cube_id = get_mem_req.mem_cube_id
+    if current_user is not None and access_control is not None:
+        actor_user_id = _resolve_actor_for(access_control, current_user, get_mem_req.user_id)
+        _require_cube_access_for(
+            current_user, access_control, actor_user_id, [cube_id] if cube_id else []
+        )
+        # Use the validated actor for subsequent filtering.
+        get_mem_req.user_id = actor_user_id
+
     results: dict[str, Any] = {"text_mem": [], "pref_mem": [], "tool_mem": [], "skill_mem": []}
     text_memory_type = ["WorkingMemory", "LongTermMemory", "UserMemory", "OuterMemory"]
     text_memories_info = naive_mem_cube.text_mem.get_all(
@@ -368,7 +469,12 @@ def _merge_delete_filter(
     return {"and": [base_filter.copy(), constraints.copy()]}
 
 
-def handle_delete_memories(delete_mem_req: DeleteMemoryRequest, naive_mem_cube: NaiveMemCube):
+def handle_delete_memories(
+    delete_mem_req: DeleteMemoryRequest,
+    naive_mem_cube: NaiveMemCube,
+    current_user: AuthContext | None = None,
+    access_control: Any = None,
+):
     """
     Handler for deleting memories.
     Now unified to delete from text_mem only (includes preferences).
@@ -411,6 +517,42 @@ def handle_delete_memories(delete_mem_req: DeleteMemoryRequest, naive_mem_cube: 
         )
 
     try:
+        # Actor -> cube validation before any delete side effect (plan 5.3 #8).
+        # memory_ids mode: pre-read metadata and reverse-map cubes (5.4
+        # all-or-nothing); file/filter modes use explicit writable cubes or the
+        # actor's default cube.
+        if current_user is not None and access_control is not None:
+            actor_user_id = _resolve_actor_for(
+                access_control, current_user, delete_mem_req.user_id
+            )
+            if delete_mem_req.memory_ids is not None:
+                pre_read = []
+                if not access_control.is_bypassed(current_user):
+                    try:
+                        pre_read = naive_mem_cube.text_mem.get_by_ids(
+                            memory_ids=delete_mem_req.memory_ids
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to pre-read memories for delete validation: %s", e)
+                        pre_read = []
+                    cube_ids = _cube_ids_from_memories(
+                        list(pre_read or []), list(delete_mem_req.memory_ids)
+                    )
+                    _require_cube_access_for(
+                        current_user, access_control, actor_user_id, cube_ids
+                    )
+            elif delete_mem_req.writable_cube_ids:
+                _require_cube_access_for(
+                    current_user,
+                    access_control,
+                    actor_user_id,
+                    list(delete_mem_req.writable_cube_ids),
+                )
+            elif actor_user_id:
+                _require_cube_access_for(
+                    current_user, access_control, actor_user_id, [actor_user_id]
+                )
+
         working_ids_to_delete: set[str] = set()
         # When deleting by explicit memory_ids and auto_cleanup_working is enabled,
         # collect related WorkingMemory ids from working_binding
@@ -462,6 +604,10 @@ def handle_delete_memories(delete_mem_req: DeleteMemoryRequest, naive_mem_cube: 
                 naive_mem_cube.text_mem.delete_by_memory_ids(list(working_ids_to_delete))
             except Exception as e:
                 logger.warning("Failed to auto-cleanup WorkingMemory nodes: %s, Pass", e)
+    except HTTPException:
+        # Authorization failures must propagate as-is (plan 5.5): a denied
+        # delete is a 403, never a business 200-failure response.
+        raise
     except Exception as e:
         logger.error(f"Failed to delete memories: {e}", exc_info=True)
         return DeleteMemoryResponse(
