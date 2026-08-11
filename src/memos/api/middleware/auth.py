@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import os
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 
@@ -19,6 +20,7 @@ from fastapi.security import APIKeyHeader
 import memos.log
 
 from memos.context.context import set_current_user_name
+from memos.mem_user.user_manager import UserRole
 
 
 logger = memos.log.get_logger(__name__)
@@ -328,3 +330,95 @@ def require_scope(required_scope: str):
 require_read = require_scope("read")
 require_write = require_scope("write")
 require_admin = require_scope("admin")
+
+
+# ---------------------------------------------------------------------------
+# Web console principal (design: docs/plans/web-console-session-design.md)
+#
+# Independent of verify_api_key(): a Web session token (``wca_``) never
+# touches the API-key path, never populates AuthContext, and never becomes
+# ``is_master_key``. The resolved identity is written to
+# ``request.state.web_principal`` for console routers.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WebPrincipal:
+    """Authenticated console identity (session bearer or legacy admin key).
+
+    ``source`` records how the identity was established: ``session`` for
+    ``wca_`` Web sessions, ``api_key`` for admin-scope ``krlk_`` keys mapped
+    to a ROOT/ADMIN user, ``master_key``, ``internal`` or ``auth_bypassed``
+    for the legacy non-session paths that keep their historical reach.
+    """
+
+    user_id: str | None
+    user_name: str
+    role: UserRole
+    is_master_key: bool = False
+    source: str = "session"
+
+
+def extract_bearer_token(request: Request) -> str | None:
+    """Return the raw ``Authorization: Bearer`` payload, or None."""
+    header = request.headers.get("authorization", "")
+    if header.startswith("Bearer "):
+        token = header[len("Bearer ") :].strip()
+        return token or None
+    return None
+
+
+async def verify_web_access_token(request: Request) -> WebPrincipal:
+    """Resolve a ``wca_`` session bearer token into a :class:`WebPrincipal`.
+
+    Raises:
+        HTTPException 401 for missing/malformed/expired/revoked tokens or a
+        disabled account, 503 when the auth services are not configured.
+    """
+    from memos.api.web_auth import ACCESS_TOKEN_PREFIX, WebAuthError
+
+    token = extract_bearer_token(request)
+    if not token or not token.startswith(ACCESS_TOKEN_PREFIX):
+        raise HTTPException(
+            status_code=401,
+            detail="access_token_invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        # Lazy import: auth_router does not import this module, but keeping
+        # the router out of middleware import time avoids any future cycle.
+        from memos.api.routers.auth_router import get_services
+
+        services = get_services()
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="web_auth_not_configured") from None
+
+    try:
+        record = services.session_service.validate_access(token)
+    except WebAuthError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=exc.code,
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    user = services.user_manager.get_user(record.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=401,
+            detail="session_revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    role = user.role if isinstance(user.role, UserRole) else UserRole(user.role)
+    principal = WebPrincipal(
+        user_id=user.user_id,
+        user_name=user.user_name,
+        role=role,
+        is_master_key=False,
+        source="session",
+    )
+    request.state.web_principal = principal
+    request.state.user = user.user_name
+    return principal
