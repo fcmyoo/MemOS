@@ -19,6 +19,7 @@ from memos.api.middleware.request_context import RequestContextMiddleware
 from memos.api.middleware.security import SecurityHeadersMiddleware
 from memos.api.routers import server_router as server_router_module
 from memos.api.routers.admin_router import router as admin_router
+from memos.api.routers.auth_router import WebAuthHTTPError
 from memos.plugins.manager import plugin_manager
 
 
@@ -44,8 +45,46 @@ logger.info(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    # Initialize the Web console auth services once at startup so real
+    # deployments (not just tests) can register/login/refresh.
+    if AUTH_ENABLED:
+        from memos.api.routers.auth_router import (
+            AuthServices,
+            set_auth_services,
+        )
+        from memos.api.web_auth import (
+            SessionService,
+            WebPasswordService,
+            WebRateLimiter,
+            WebSessionStore,
+            WebTokenService,
+        )
+        from memos.mem_user.user_manager import UserManager
+
+        user_manager = UserManager()
+        store = WebSessionStore()
+        tokens = WebTokenService()
+        services = AuthServices(
+            user_manager=user_manager,
+            session_service=SessionService(
+                store=store,
+                tokens=tokens,
+                is_user_active=user_manager.validate_user,
+            ),
+            passwords=WebPasswordService(),
+            rate_limiter=WebRateLimiter(),
+        )
+        set_auth_services(services)
+        logger.info("[SERVER_API] Web console auth services initialized")
     yield
     shutdown_components(server_router_module.components)
+    if AUTH_ENABLED:
+        try:
+            from memos.api.routers.auth_router import set_auth_services
+
+            set_auth_services(None)
+        except Exception:  # noqa: BLE001 - shutdown must never raise
+            pass
 
 
 app = FastAPI(
@@ -73,6 +112,15 @@ app.add_middleware(
 app.include_router(server_router_module.router, dependencies=[Depends(verify_api_key)])
 if AUTH_ENABLED:
     app.include_router(admin_router)
+    from memos.api.routers.auth_router import (
+        router as web_auth_router,
+        web_auth_error_handler,
+    )
+    from memos.api.routers.me_router import router as me_router
+
+    app.add_exception_handler(WebAuthHTTPError, web_auth_error_handler)
+    app.include_router(web_auth_router)
+    app.include_router(me_router)
 
 
 @app.get("/health")
