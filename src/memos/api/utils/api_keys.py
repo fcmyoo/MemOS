@@ -18,6 +18,7 @@ class APIKey:
     key: str  # Full key (only available at creation time)
     key_hash: str  # SHA-256 hash (stored in database)
     key_prefix: str  # First 12 chars for identification
+    id: str | None = None  # Database row id (filled after INSERT)
 
 
 def generate_api_key() -> APIKey:
@@ -126,7 +127,10 @@ def create_api_key_in_db(
                 created_by,
             ),
         )
+        row = cur.fetchone()
         conn.commit()
+        if row is not None:
+            api_key.id = str(row[0])
 
     return api_key
 
@@ -142,6 +146,31 @@ def revoke_api_key(conn, key_id: str) -> bool:
         cur.execute(
             "UPDATE api_keys SET is_active = false WHERE id = %s AND is_active = true",
             (key_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def revoke_api_key_for_user(conn, key_id: str, user_name: str) -> bool:
+    """
+    Revoke an API key only when it belongs to ``user_name`` (owner-safe).
+
+    The owner condition lives inside a single atomic UPDATE, so a key owned
+    by someone else is never revoked — the statement simply matches no row.
+    Callers must treat False uniformly as "not found / not yours / already
+    revoked" to prevent key-ID enumeration.
+
+    Returns:
+        True if the key was active and owned by ``user_name`` (now revoked).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE api_keys
+            SET is_active = FALSE
+            WHERE id = %s AND user_name = %s AND is_active = TRUE;
+            """,
+            (key_id, user_name),
         )
         conn.commit()
         return cur.rowcount > 0
