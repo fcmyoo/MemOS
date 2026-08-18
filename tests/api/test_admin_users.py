@@ -85,7 +85,7 @@ class _FakeArgon2Hasher:
 
 
 @pytest.fixture()
-def admin_env(tmp_path, monkeypatch):
+def admin_env(tmp_path, monkeypatch, postgres_test_schema):
     """App mounting both auth and admin routers with injected services.
 
     Pins the middleware module attributes the real ``verify_api_key`` reads so
@@ -99,7 +99,12 @@ def admin_env(tmp_path, monkeypatch):
     clock = FakeClock(start=EPOCH)
     db_path = str(tmp_path / "memos_users.db")
     user_manager = UserManager(db_path=db_path)
-    store = WebSessionStore(db_path=db_path, clock=clock)
+    store = WebSessionStore(
+        database_url=postgres_test_schema.url,
+        schema=postgres_test_schema.schema,
+        clock=clock,
+    )
+    postgres_test_schema.register(store.engine)
     tokens = WebTokenService(clock=clock)
     services = AuthServices(
         user_manager=user_manager,
@@ -130,6 +135,7 @@ def admin_env(tmp_path, monkeypatch):
 
     set_auth_services(None)
     user_manager.close()
+    store.close()
 
 
 @pytest.fixture()

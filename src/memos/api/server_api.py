@@ -59,9 +59,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             WebSessionStore,
             WebTokenService,
         )
-        from memos.mem_user.user_manager import UserManager
+        from memos.mem_user.factory import create_runtime_user_manager
 
-        user_manager = UserManager()
+        user_manager = create_runtime_user_manager()
         store = WebSessionStore()
         tokens = WebTokenService()
         services = AuthServices(

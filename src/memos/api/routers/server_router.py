@@ -63,7 +63,7 @@ from memos.api.product_models import (
 from memos.log import get_logger
 from memos.mem_scheduler.base_scheduler import BaseScheduler
 from memos.mem_scheduler.utils.status_tracker import TaskStatusTracker
-from memos.mem_user.user_manager import UserManager
+from memos.mem_user.factory import create_runtime_user_manager
 
 
 logger = get_logger(__name__)
@@ -78,7 +78,7 @@ components = handlers.init_server()
 
 # Shared user manager and access control: one authorization object per process
 # so every handler validates cube membership against the same database.
-user_manager = UserManager()
+user_manager = create_runtime_user_manager()
 access_control = CubeAccessControl(user_manager)
 
 # Create dependency container

@@ -1,7 +1,10 @@
+import os
+
 from typing import Any, ClassVar
 
 from memos.configs.mem_user import UserManagerConfigFactory
 from memos.mem_user.mysql_user_manager import MySQLUserManager
+from memos.mem_user.postgres_user_manager import PostgresUserManager
 from memos.mem_user.user_manager import UserManager
 
 
@@ -11,12 +14,13 @@ class UserManagerFactory:
     backend_to_class: ClassVar[dict[str, Any]] = {
         "sqlite": UserManager,
         "mysql": MySQLUserManager,
+        "postgres": PostgresUserManager,
     }
 
     @classmethod
     def from_config(
         cls, config_factory: UserManagerConfigFactory
-    ) -> UserManager | MySQLUserManager:
+    ) -> UserManager | MySQLUserManager | PostgresUserManager:
         """Create a user manager instance from configuration.
 
         Args:
@@ -92,3 +96,26 @@ class UserManagerFactory:
             },
         )
         return cls.from_config(config_factory)
+
+
+def create_runtime_user_manager() -> UserManager | PostgresUserManager:
+    """Create the runtime user manager from the ``USER_DB_BACKEND`` env var.
+
+    This is the single runtime entry point for production wiring. It defaults
+    to the zero-configuration ``postgres`` backend and falls back to the
+    original ``sqlite`` manager when ``USER_DB_BACKEND=sqlite`` is set
+    explicitly. MySQL keeps going through the explicit ``from_config`` /
+    ``create_mysql`` path rather than inventing runtime environment
+    parameters.
+
+    Returns:
+        A ``PostgresUserManager`` (default) or ``UserManager`` (explicit
+        ``USER_DB_BACKEND=sqlite``).
+
+    Raises:
+        ValueError: If ``USER_DB_BACKEND`` is set to an unsupported value.
+    """
+    backend = os.getenv("USER_DB_BACKEND", "postgres").strip().lower()
+    if backend not in {"postgres", "sqlite"}:
+        raise ValueError(f"Invalid user manager backend: {backend}")
+    return UserManagerFactory.backend_to_class[backend]()

@@ -13,10 +13,9 @@ middleware (``memos.api.middleware.auth``) and never touches it:
   dependency is imported lazily; when it is missing a clear, actionable error
   is raised instead of an import failure (it is an optional extra and must not
   be added to pyproject.toml without separate approval).
-- ``WebSessionStore``: SQLite storage for ``web_sessions`` with WAL,
-  ``foreign_keys=ON`` and ``busy_timeout=5000`` connections, idempotent
-  schema creation, CAS-style atomic rotation (safe under multiple workers)
-  and bounded cleanup of long-expired rows.
+- ``WebSessionStore``: PostgreSQL storage for ``web_sessions`` (one shared
+  schema, any number of workers), idempotent schema creation, CAS-style
+  atomic rotation and bounded cleanup of long-expired rows.
 
 Only token *hashes* are ever stored; plaintext tokens exist solely in
 transit/responses.
@@ -28,17 +27,31 @@ import hashlib
 import hmac
 import re
 import secrets
-import sqlite3
 import time
 import uuid
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
-from memos import settings
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    delete,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.engine import URL
+
 from memos.log import get_logger
+from memos.mem_user.postgres_connection import create_postgres_engine
 
 
 logger = get_logger(__name__)
@@ -274,59 +287,46 @@ class WebPasswordService:
 
 
 # ---------------------------------------------------------------------------
-# Session store (SQLite)
+# Session store (PostgreSQL)
 # ---------------------------------------------------------------------------
 
 WEB_SESSIONS_TABLE = "web_sessions"
 
-_WEB_SESSIONS_DDL = """\
-CREATE TABLE IF NOT EXISTS web_sessions (
-    session_family_id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    access_token_hash TEXT NOT NULL UNIQUE,
-    access_expires_at TEXT NOT NULL,
-    refresh_token_hash TEXT NOT NULL UNIQUE,
-    previous_refresh_hash TEXT,
-    previous_refresh_valid_until TEXT,
-    refresh_expires_at TEXT NOT NULL,
-    rotation_counter INTEGER NOT NULL DEFAULT 0,
-    rotated_at TEXT,
-    last_refreshed_at TEXT,
-    revoked_at TEXT,
-    revoke_reason TEXT,
-    created_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL
-)
-"""
+#: Isolated metadata owning only ``web_sessions``, so ``create_all`` can never
+#: reach tables owned by other backends (``api_keys``, ``users``, ...).
+_web_sessions_metadata = MetaData()
 
-_WEB_SESSIONS_INDEX_DDL = """
-CREATE INDEX IF NOT EXISTS idx_web_sessions_user_active
-ON web_sessions(user_id, revoked_at, refresh_expires_at)
-"""
+web_sessions = Table(
+    WEB_SESSIONS_TABLE,
+    _web_sessions_metadata,
+    Column("session_family_id", String, primary_key=True),
+    Column("user_id", String, nullable=False),
+    Column("access_token_hash", String, nullable=False, unique=True),
+    Column("access_expires_at", DateTime(timezone=True), nullable=False),
+    Column("refresh_token_hash", String, nullable=False, unique=True),
+    Column("previous_refresh_hash", String),
+    Column("previous_refresh_valid_until", DateTime(timezone=True)),
+    Column("refresh_expires_at", DateTime(timezone=True), nullable=False),
+    Column("rotation_counter", Integer, nullable=False, server_default=text("0")),
+    Column("rotated_at", DateTime(timezone=True)),
+    Column("last_refreshed_at", DateTime(timezone=True)),
+    Column("revoked_at", DateTime(timezone=True)),
+    Column("revoke_reason", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("last_seen_at", DateTime(timezone=True), nullable=False),
+    Index(
+        "idx_web_sessions_user_active",
+        "user_id",
+        "revoked_at",
+        "refresh_expires_at",
+    ),
+)
 
 # Revoked/expired sessions are kept for a bounded audit window, then cleaned
 # up in bounded batches (design doc 3.1: refresh_expires_at + 30 days, max
 # 100 rows per pass).
 CLEANUP_RETENTION = timedelta(days=30)
 CLEANUP_DEFAULT_LIMIT = 100
-
-_SESSION_COLUMNS = (
-    "session_family_id",
-    "user_id",
-    "access_token_hash",
-    "access_expires_at",
-    "refresh_token_hash",
-    "previous_refresh_hash",
-    "previous_refresh_valid_until",
-    "refresh_expires_at",
-    "rotation_counter",
-    "rotated_at",
-    "last_refreshed_at",
-    "revoked_at",
-    "revoke_reason",
-    "created_at",
-    "last_seen_at",
-)
 
 
 @dataclass(frozen=True)
@@ -350,96 +350,77 @@ class WebSessionRecord:
     last_seen_at: datetime
 
 
-def _serialize_dt(value: datetime) -> str:
-    """Fixed-width ISO-8601 UTC so lexicographic order == chronological order."""
+def _to_utc(value: datetime) -> datetime:
+    """Return ``value`` as a timezone-aware UTC datetime (naive inputs → UTC)."""
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).isoformat(timespec="microseconds")
+    return value.astimezone(UTC)
 
 
 def _parse_dt(value: str | datetime | None) -> datetime | None:
+    """Parse a stored timestamp (ISO string or datetime) into aware UTC."""
     if value is None:
         return None
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    return _to_utc(value)
 
 
 class WebSessionStore:
-    """SQLite persistence for Web console sessions.
+    """PostgreSQL persistence for Web console sessions.
 
-    Connections are configured for multi-worker deployments: WAL journal,
-    ``busy_timeout=5000``, ``foreign_keys=ON``, ``check_same_thread=False``.
-    Writes use ``BEGIN IMMEDIATE`` plus conditional UPDATEs, so concurrent
-    rotations resolve as a single winner (CAS semantics) without half-updates.
+    State lives in the shared ``web_sessions`` table, so any number of
+    workers see the same sessions. Writes run in ``engine.begin()``
+    transactions with conditional UPDATEs; concurrent rotations resolve as a
+    single winner (CAS semantics) without half-updates. Only token hashes are
+    ever persisted.
     """
 
-    def __init__(self, db_path: str | None = None, clock: ClockService | None = None):
-        if db_path is None:
-            db_path = str(settings.MEMOS_DIR / "memos_users.db")
-        self.db_path = db_path
+    def __init__(
+        self,
+        database_url: str | URL | None = None,
+        schema: str | None = None,
+        clock: ClockService | None = None,
+    ) -> None:
+        self.engine = create_postgres_engine(database_url, schema)
         self.clock = clock or ClockService()
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         # In-process index of refresh hashes that were rotated away / consumed,
         # mapped to their family. Used to distinguish "reused old token" from
         # "never seen token" once the token no longer matches any slot.
         self._consumed_refresh_hashes: dict[str, str] = {}
         self._ensure_schema()
 
-    # -- connection / schema ---------------------------------------------------
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    # -- schema ----------------------------------------------------------------
 
     def _ensure_schema(self) -> None:
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(_WEB_SESSIONS_DDL)
-            conn.execute(_WEB_SESSIONS_INDEX_DDL)
-            # Idempotent phase-3 migration (adds grace/rotation/revoke columns).
-            _migrate_web_sessions_schema(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        """Idempotently create the ``web_sessions`` table and its index."""
+        _web_sessions_metadata.create_all(self.engine, checkfirst=True)
+
+    def close(self) -> None:
+        """Dispose the connection pool. Idempotent; safe to call repeatedly."""
+        self.engine.dispose()
 
     # -- helpers ---------------------------------------------------------------
 
     @staticmethod
-    def _row_to_record(row: tuple) -> WebSessionRecord:
-        values = dict(zip(_SESSION_COLUMNS, row, strict=True))
+    def _row_to_record(mapping: Mapping[str, Any]) -> WebSessionRecord:
         return WebSessionRecord(
-            session_family_id=values["session_family_id"],
-            user_id=values["user_id"],
-            access_token_hash=values["access_token_hash"],
-            access_expires_at=_parse_dt(values["access_expires_at"]),  # type: ignore[arg-type]
-            refresh_token_hash=values["refresh_token_hash"],
-            previous_refresh_hash=values["previous_refresh_hash"],
-            previous_refresh_valid_until=_parse_dt(values["previous_refresh_valid_until"]),
-            refresh_expires_at=_parse_dt(values["refresh_expires_at"]),  # type: ignore[arg-type]
-            rotation_counter=values["rotation_counter"] or 0,
-            rotated_at=_parse_dt(values["rotated_at"]),
-            last_refreshed_at=_parse_dt(values["last_refreshed_at"]),
-            revoked_at=_parse_dt(values["revoked_at"]),
-            revoke_reason=values["revoke_reason"],
-            created_at=_parse_dt(values["created_at"]),  # type: ignore[arg-type]
-            last_seen_at=_parse_dt(values["last_seen_at"]),  # type: ignore[arg-type]
+            session_family_id=mapping["session_family_id"],
+            user_id=mapping["user_id"],
+            access_token_hash=mapping["access_token_hash"],
+            access_expires_at=_parse_dt(mapping["access_expires_at"]),  # type: ignore[arg-type]
+            refresh_token_hash=mapping["refresh_token_hash"],
+            previous_refresh_hash=mapping["previous_refresh_hash"],
+            previous_refresh_valid_until=_parse_dt(mapping["previous_refresh_valid_until"]),
+            refresh_expires_at=_parse_dt(mapping["refresh_expires_at"]),  # type: ignore[arg-type]
+            rotation_counter=mapping["rotation_counter"] or 0,
+            rotated_at=_parse_dt(mapping["rotated_at"]),
+            last_refreshed_at=_parse_dt(mapping["last_refreshed_at"]),
+            revoked_at=_parse_dt(mapping["revoked_at"]),
+            revoke_reason=mapping["revoke_reason"],
+            created_at=_parse_dt(mapping["created_at"]),  # type: ignore[arg-type]
+            last_seen_at=_parse_dt(mapping["last_seen_at"]),  # type: ignore[arg-type]
         )
-
-    @staticmethod
-    def _select_columns() -> str:
-        return ", ".join(_SESSION_COLUMNS)
 
     # -- operations -------------------------------------------------------------
 
@@ -455,33 +436,21 @@ class WebSessionStore:
     ) -> str:
         """Insert a new session row and return its ``session_family_id``."""
         family_id = session_family_id or uuid.uuid4().hex
-        moment = _serialize_dt(now if now is not None else self.clock.now())
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        moment = _to_utc(now if now is not None else self.clock.now())
+        with self.engine.begin() as conn:
             conn.execute(
-                "INSERT INTO web_sessions ("
-                "session_family_id, user_id, access_token_hash, access_expires_at, "
-                "refresh_token_hash, refresh_expires_at, created_at, last_seen_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    family_id,
-                    user_id,
-                    access_token_hash,
-                    _serialize_dt(access_expires_at),
-                    refresh_token_hash,
-                    _serialize_dt(refresh_expires_at),
-                    moment,
-                    moment,
-                ),
+                web_sessions.insert().values(
+                    session_family_id=family_id,
+                    user_id=user_id,
+                    access_token_hash=access_token_hash,
+                    access_expires_at=_to_utc(access_expires_at),
+                    refresh_token_hash=refresh_token_hash,
+                    refresh_expires_at=_to_utc(refresh_expires_at),
+                    created_at=moment,
+                    last_seen_at=moment,
+                )
             )
-            conn.commit()
-            return family_id
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return family_id
 
     def validate_access(
         self,
@@ -493,42 +462,25 @@ class WebSessionStore:
         Read-only: checks ``revoked_at IS NULL`` and a non-expired
         ``access_expires_at`` using the injected clock.
         """
-        moment = _serialize_dt(now if now is not None else self.clock.now())
-        conn = self._connect()
-        try:
+        moment = _to_utc(now if now is not None else self.clock.now())
+        with self.engine.connect() as conn:
             row = conn.execute(
-                f"SELECT {self._select_columns()} FROM web_sessions "
-                "WHERE access_token_hash = ? AND revoked_at IS NULL "
-                "AND access_expires_at > ?",
-                (access_token_hash, moment),
-            ).fetchone()
-            return self._row_to_record(row) if row else None
-        finally:
-            conn.close()
+                select(web_sessions).where(
+                    web_sessions.c.access_token_hash == access_token_hash,
+                    web_sessions.c.revoked_at.is_(None),
+                    web_sessions.c.access_expires_at > moment,
+                )
+            ).mappings().fetchone()
+        return self._row_to_record(row) if row else None
 
     def get_session(self, session_family_id: str) -> WebSessionRecord | None:
-        conn = self._connect()
-        try:
+        with self.engine.connect() as conn:
             row = conn.execute(
-                f"SELECT {self._select_columns()} FROM web_sessions "
-                "WHERE session_family_id = ?",
-                (session_family_id,),
-            ).fetchone()
-            return self._row_to_record(row) if row else None
-        finally:
-            conn.close()
-
-    def get_by_refresh_hash(self, refresh_token_hash: str) -> WebSessionRecord | None:
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                f"SELECT {self._select_columns()} FROM web_sessions "
-                "WHERE refresh_token_hash = ?",
-                (refresh_token_hash,),
-            ).fetchone()
-            return self._row_to_record(row) if row else None
-        finally:
-            conn.close()
+                select(web_sessions).where(
+                    web_sessions.c.session_family_id == session_family_id,
+                )
+            ).mappings().fetchone()
+        return self._row_to_record(row) if row else None
 
     def rotate_refresh(
         self,
@@ -544,76 +496,90 @@ class WebSessionStore:
 
         Succeeds only when the row is unrevoked and still carries
         ``expected_refresh_hash``; the previous refresh hash is retained for
-        the reuse-grace logic built in phase 3. Concurrent rotators serialize
-        via ``BEGIN IMMEDIATE`` and the conditional UPDATE — exactly one wins.
+        the reuse-grace logic built in phase 3. The conditional UPDATE makes
+        concurrent rotators resolve to exactly one winner.
         """
-        moment = _serialize_dt(now if now is not None else self.clock.now())
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
-                "UPDATE web_sessions SET "
-                "access_token_hash = ?, access_expires_at = ?, "
-                "refresh_token_hash = ?, previous_refresh_hash = ?, "
-                "rotated_at = ?, last_seen_at = ? "
-                "WHERE session_family_id = ? AND refresh_token_hash = ? "
-                "AND revoked_at IS NULL",
-                (
-                    new_access_token_hash,
-                    _serialize_dt(new_access_expires_at),
-                    new_refresh_token_hash,
-                    expected_refresh_hash,
-                    moment,
-                    moment,
-                    session_family_id,
-                    expected_refresh_hash,
-                ),
+        moment = _to_utc(now if now is not None else self.clock.now())
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                update(web_sessions)
+                .where(
+                    web_sessions.c.session_family_id == session_family_id,
+                    web_sessions.c.refresh_token_hash == expected_refresh_hash,
+                    web_sessions.c.revoked_at.is_(None),
+                )
+                .values(
+                    access_token_hash=new_access_token_hash,
+                    access_expires_at=_to_utc(new_access_expires_at),
+                    refresh_token_hash=new_refresh_token_hash,
+                    previous_refresh_hash=expected_refresh_hash,
+                    rotated_at=moment,
+                    last_seen_at=moment,
+                )
             )
-            conn.commit()
-            return cursor.rowcount == 1
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return result.rowcount == 1
 
     def revoke(self, session_family_id: str, now: datetime | None = None) -> bool:
         """Revoke one session; False when it was already revoked/unknown."""
-        moment = _serialize_dt(now if now is not None else self.clock.now())
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
-                "UPDATE web_sessions SET revoked_at = ? "
-                "WHERE session_family_id = ? AND revoked_at IS NULL",
-                (moment, session_family_id),
+        moment = _to_utc(now if now is not None else self.clock.now())
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                update(web_sessions)
+                .where(
+                    web_sessions.c.session_family_id == session_family_id,
+                    web_sessions.c.revoked_at.is_(None),
+                )
+                .values(revoked_at=moment)
             )
-            conn.commit()
-            return cursor.rowcount == 1
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return result.rowcount == 1
 
     def revoke_user_sessions(self, user_id: str, now: datetime | None = None) -> int:
         """Revoke every active session of a user (logout-all / disable)."""
-        moment = _serialize_dt(now if now is not None else self.clock.now())
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
-                "UPDATE web_sessions SET revoked_at = ? "
-                "WHERE user_id = ? AND revoked_at IS NULL",
-                (moment, user_id),
+        moment = _to_utc(now if now is not None else self.clock.now())
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                update(web_sessions)
+                .where(
+                    web_sessions.c.user_id == user_id,
+                    web_sessions.c.revoked_at.is_(None),
+                )
+                .values(revoked_at=moment)
             )
-            conn.commit()
-            return cursor.rowcount
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return result.rowcount
+
+    def enforce_family_cap(
+        self,
+        user_id: str,
+        max_families: int,
+        now: datetime | None = None,
+    ) -> int:
+        """Revoke the oldest active families beyond ``max_families``.
+
+        Runs in one transaction so the cap holds even under concurrent
+        logins; returns the number revoked.
+        """
+        moment = _to_utc(now if now is not None else self.clock.now())
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(web_sessions.c.session_family_id)
+                .where(
+                    web_sessions.c.user_id == user_id,
+                    web_sessions.c.revoked_at.is_(None),
+                )
+                .order_by(web_sessions.c.created_at.asc())
+            ).scalars().all()
+            if len(rows) <= max_families:
+                return 0
+            oldest = rows[: len(rows) - max_families]
+            revoked = conn.execute(
+                update(web_sessions)
+                .where(
+                    web_sessions.c.session_family_id.in_(oldest),
+                    web_sessions.c.revoked_at.is_(None),
+                )
+                .values(revoked_at=moment, revoke_reason="family_cap")
+            ).rowcount
+        return revoked
 
     def cleanup_expired(
         self,
@@ -627,54 +593,45 @@ class WebSessionStore:
         early-revoked sessions). Bounded so login/startup never stall on a
         mass delete.
         """
-        moment = now if now is not None else self.clock.now()
-        cutoff = _serialize_dt(moment - CLEANUP_RETENTION)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
-                "DELETE FROM web_sessions WHERE session_family_id IN ("
-                "SELECT session_family_id FROM web_sessions "
-                "WHERE refresh_expires_at <= ? LIMIT ?)",
-                (cutoff, limit),
+        moment = _to_utc(now if now is not None else self.clock.now())
+        cutoff = moment - CLEANUP_RETENTION
+        eligible = (
+            select(web_sessions.c.session_family_id)
+            .where(web_sessions.c.refresh_expires_at <= cutoff)
+            .limit(limit)
+        )
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                delete(web_sessions).where(
+                    web_sessions.c.session_family_id.in_(eligible)
+                )
             )
-            conn.commit()
-            return cursor.rowcount
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return result.rowcount
 
     # -- phase-3 lookup helpers ----------------------------------------------
     def find_by_access_hash(self, access_token_hash: str) -> WebSessionRecord | None:
         """Return the row for an access hash regardless of expiry/revocation."""
-        conn = self._connect()
-        try:
+        with self.engine.connect() as conn:
             row = conn.execute(
-                f"SELECT {self._select_columns()} FROM web_sessions "
-                "WHERE access_token_hash = ?",
-                (access_token_hash,),
-            ).fetchone()
-            return self._row_to_record(row) if row else None
-        finally:
-            conn.close()
+                select(web_sessions).where(
+                    web_sessions.c.access_token_hash == access_token_hash,
+                )
+            ).mappings().fetchone()
+        return self._row_to_record(row) if row else None
 
     def find_by_any_refresh_hash(self, refresh_token_hash: str) -> WebSessionRecord | None:
         """Match a refresh hash in either the current or previous slot."""
-        conn = self._connect()
-        try:
+        with self.engine.connect() as conn:
             row = conn.execute(
-                f"SELECT {self._select_columns()} FROM web_sessions "
-                "WHERE refresh_token_hash = ? OR previous_refresh_hash = ?",
-                (refresh_token_hash, refresh_token_hash),
-            ).fetchone()
-            return self._row_to_record(row) if row else None
-        finally:
-            conn.close()
+                select(web_sessions).where(
+                    (web_sessions.c.refresh_token_hash == refresh_token_hash)
+                    | (web_sessions.c.previous_refresh_hash == refresh_token_hash)
+                )
+            ).mappings().fetchone()
+        return self._row_to_record(row) if row else None
 
     def get_by_refresh_hash(self, refresh_token_hash: str) -> WebSessionRecord | None:
-        """Return the row whose *current* refresh hash matches."""
+        """Return the row whose current or previous refresh hash matches."""
         return self.find_by_any_refresh_hash(refresh_token_hash)
 
     # -- phase-3 consume_refresh ---------------------------------------------
@@ -691,47 +648,48 @@ class WebSessionStore:
 
         Returns a ``ConsumeOutcome`` instead of raising: the caller maps the
         status to the appropriate HTTP response. All state transitions happen
-        in one ``BEGIN IMMEDIATE`` transaction.
+        in one transaction; any exception rolls the whole thing back.
         """
-        moment = now if now is not None else self.clock.now()
-        moment_str = _serialize_dt(moment)
+        moment = _to_utc(now if now is not None else self.clock.now())
         grace_eff = min(grace or PREVIOUS_REFRESH_GRACE, MAX_REFRESH_GRACE)
 
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.engine.begin() as conn:
             row = conn.execute(
-                f"SELECT {self._select_columns()} FROM web_sessions "
-                "WHERE refresh_token_hash = ? OR previous_refresh_hash = ?",
-                (refresh_token_hash, refresh_token_hash),
-            ).fetchone()
+                select(web_sessions).where(
+                    (web_sessions.c.refresh_token_hash == refresh_token_hash)
+                    | (web_sessions.c.previous_refresh_hash == refresh_token_hash)
+                )
+            ).mappings().fetchone()
             if row is None:
                 # Not in any slot: distinguish a never-seen token (INVALID)
                 # from a rotated-away token that is being replayed (REUSED).
                 family = self._consumed_refresh_hashes.get(refresh_token_hash)
                 if family is not None:
                     conn.execute(
-                        "UPDATE web_sessions SET revoked_at = ?, revoke_reason = ? "
-                        "WHERE session_family_id = ? AND revoked_at IS NULL",
-                        (moment_str, "refresh_reuse", family),
+                        update(web_sessions)
+                        .where(
+                            web_sessions.c.session_family_id == family,
+                            web_sessions.c.revoked_at.is_(None),
+                        )
+                        .values(revoked_at=moment, revoke_reason="refresh_reuse")
                     )
-                    conn.commit()
-                    return ConsumeOutcome(status=RotateStatus.REUSED, session_family_id=family)
-                conn.rollback()
+                    return ConsumeOutcome(
+                        status=RotateStatus.REUSED, session_family_id=family
+                    )
                 return ConsumeOutcome(status=RotateStatus.INVALID)
             record = self._row_to_record(row)
             family = record.session_family_id
 
             if record.revoked_at is not None:
-                conn.rollback()
-                return ConsumeOutcome(status=RotateStatus.REVOKED, session_family_id=family)
+                return ConsumeOutcome(
+                    status=RotateStatus.REVOKED, session_family_id=family
+                )
 
-            if _parse_dt(record.refresh_expires_at) <= moment:
-                conn.rollback()
+            if record.refresh_expires_at <= moment:
                 return ConsumeOutcome(
                     status=RotateStatus.EXPIRED,
                     session_family_id=family,
-                    refresh_expires_at=_parse_dt(record.refresh_expires_at),
+                    refresh_expires_at=record.refresh_expires_at,
                 )
 
             is_current = record.refresh_token_hash == refresh_token_hash
@@ -740,7 +698,7 @@ class WebSessionStore:
             # client that passes grace=120s still recovers up to 30s.
             within_grace = (
                 record.rotated_at is not None
-                and (moment - _parse_dt(record.rotated_at)) <= grace_eff
+                and (moment - record.rotated_at) <= grace_eff
             )
             is_previous = (
                 record.previous_refresh_hash == refresh_token_hash
@@ -750,12 +708,16 @@ class WebSessionStore:
             if not is_current and not is_previous:
                 # Old generation reused outside the grace window: revoke family.
                 conn.execute(
-                    "UPDATE web_sessions SET revoked_at = ?, revoke_reason = ? "
-                    "WHERE session_family_id = ? AND revoked_at IS NULL",
-                    (moment_str, "refresh_reuse", family),
+                    update(web_sessions)
+                    .where(
+                        web_sessions.c.session_family_id == family,
+                        web_sessions.c.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=moment, revoke_reason="refresh_reuse")
                 )
-                conn.commit()
-                return ConsumeOutcome(status=RotateStatus.REUSED, session_family_id=family)
+                return ConsumeOutcome(
+                    status=RotateStatus.REUSED, session_family_id=family
+                )
 
             status = RotateStatus.ROTATED if is_current else RotateStatus.RECOVERED
             new_rotation = record.rotation_counter + 1
@@ -763,44 +725,37 @@ class WebSessionStore:
             # that is the current token; for RECOVERED the previously-current
             # token becomes the new previous (chain stays recoverable once).
             prev_hash = record.refresh_token_hash
-            prev_until = _serialize_dt(moment + grace_eff)
+            prev_until = moment + grace_eff
             conn.execute(
-                "UPDATE web_sessions SET "
-                "access_token_hash = ?, access_expires_at = ?, "
-                "refresh_token_hash = ?, previous_refresh_hash = ?, "
-                "previous_refresh_valid_until = ?, rotation_counter = ?, "
-                "rotated_at = ?, last_refreshed_at = ?, last_seen_at = ? "
-                "WHERE session_family_id = ? AND revoked_at IS NULL",
-                (
-                    new_access_token_hash,
-                    _serialize_dt(new_access_expires_at),
-                    new_refresh_token_hash,
-                    prev_hash,
-                    prev_until,
-                    new_rotation,
-                    moment_str,
-                    moment_str,
-                    moment_str,
-                    family,
-                ),
+                update(web_sessions)
+                .where(
+                    web_sessions.c.session_family_id == family,
+                    web_sessions.c.revoked_at.is_(None),
+                )
+                .values(
+                    access_token_hash=new_access_token_hash,
+                    access_expires_at=_to_utc(new_access_expires_at),
+                    refresh_token_hash=new_refresh_token_hash,
+                    previous_refresh_hash=prev_hash,
+                    previous_refresh_valid_until=prev_until,
+                    rotation_counter=new_rotation,
+                    rotated_at=moment,
+                    last_refreshed_at=moment,
+                    last_seen_at=moment,
+                )
             )
-            conn.commit()
-            # Remember the consumed generation so a later replay of the
-            # pre-rotation token is classified as reuse, not unknown.
-            self._consumed_refresh_hashes[refresh_token_hash] = family
-            if len(self._consumed_refresh_hashes) > 10000:
-                self._consumed_refresh_hashes.clear()
-            return ConsumeOutcome(
-                status=status,
-                session_family_id=family,
-                rotation_counter=new_rotation,
-                refresh_expires_at=_parse_dt(record.refresh_expires_at),
-            )
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+
+        # Remember the consumed generation so a later replay of the
+        # pre-rotation token is classified as reuse, not unknown.
+        self._consumed_refresh_hashes[refresh_token_hash] = family
+        if len(self._consumed_refresh_hashes) > 10000:
+            self._consumed_refresh_hashes.clear()
+        return ConsumeOutcome(
+            status=status,
+            session_family_id=family,
+            rotation_counter=new_rotation,
+            refresh_expires_at=record.refresh_expires_at,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +765,11 @@ class WebSessionStore:
 #: Refresh tokens that were rotated away remain acceptable for this window,
 #: so a client that lost the rotation response (network blip) can recover.
 PREVIOUS_REFRESH_GRACE = timedelta(seconds=10)
+
+#: In-process TTL for the ``is_user_active`` cache consulted by
+#: ``validate_access``: the active-state check hits PostgreSQL, so a burst of
+#: access-token checks should only pay that cost once per user per window.
+USER_ACTIVE_CACHE_TTL = timedelta(seconds=30)
 
 
 class WebAuthError(Exception):
@@ -846,6 +806,9 @@ class SessionService:
         self.tokens = tokens
         self.is_user_active = is_user_active
         self.clock = clock or ClockService()
+        # user_id -> (is_active, monotonic expiry) for the short active-state
+        # cache consulted by validate_access (A1-2).
+        self._active_cache: dict[str, tuple[bool, float]] = {}
 
     # -- issuing -----------------------------------------------------------
     def issue_pair(self, user_id: str, now: datetime | None = None) -> TokenPair:
@@ -884,9 +847,28 @@ class SessionService:
             raise WebAuthError("session_revoked")
         if _parse_dt(record.access_expires_at) <= moment:
             raise WebAuthError("access_token_expired")
-        if not self.is_user_active(record.user_id):
+        if not self._is_user_active_cached(record.user_id):
             raise WebAuthError("session_revoked")
         return record
+
+    def _is_user_active_cached(self, user_id: str) -> bool:
+        """Return ``is_user_active(user_id)`` through a short in-process cache.
+
+        The active-state check hits PostgreSQL; caching it for
+        ``USER_ACTIVE_CACHE_TTL`` seconds means a burst of access-token checks
+        (e.g. several near-simultaneous 401s after a token expires) pays that
+        cost only once per user per window.
+        """
+        now_mono = self.clock.monotonic()
+        cached = self._active_cache.get(user_id)
+        if cached is not None and now_mono < cached[1]:
+            return cached[0]
+        is_active = self.is_user_active(user_id)
+        self._active_cache[user_id] = (
+            is_active,
+            now_mono + USER_ACTIVE_CACHE_TTL.total_seconds(),
+        )
+        return is_active
 
     # -- rotation ----------------------------------------------------------
     def rotate_refresh(self, refresh_token: str, now: datetime | None = None) -> TokenPair:
@@ -992,31 +974,7 @@ class SessionService:
 
     def _enforce_family_cap(self, user_id: str, now: datetime | None = None) -> None:
         """Revoke the oldest active sessions beyond MAX_ACTIVE_FAMILIES."""
-        moment = now if now is not None else self.clock.now()
-        conn = self.store._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                "SELECT session_family_id FROM web_sessions "
-                "WHERE user_id = ? AND revoked_at IS NULL "
-                "ORDER BY created_at ASC",
-                (user_id,),
-            ).fetchall()
-            if len(rows) <= MAX_ACTIVE_FAMILIES:
-                conn.rollback()
-                return
-            for row in rows[: len(rows) - MAX_ACTIVE_FAMILIES]:
-                conn.execute(
-                    "UPDATE web_sessions SET revoked_at = ?, revoke_reason = ? "
-                    "WHERE session_family_id = ? AND revoked_at IS NULL",
-                    (_serialize_dt(moment), "family_cap", row[0]),
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        self.store.enforce_family_cap(user_id, MAX_ACTIVE_FAMILIES, now=now)
 
 
 class WebRateLimiter:
@@ -1065,7 +1023,7 @@ class RotateStatus:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 (store-level): consume_refresh + lookup helpers + schema migration
+# Phase 3 (store-level): consume_refresh + lookup helpers
 # ---------------------------------------------------------------------------
 
 #: Absolute cap for the previous-refresh grace window (contract: 30s max).
@@ -1080,28 +1038,3 @@ class ConsumeOutcome:
     session_family_id: str | None = None
     rotation_counter: int = 0
     refresh_expires_at: datetime | None = None
-
-
-def _web_sessions_columns(conn) -> set[str]:
-    return {row[1] for row in conn.execute("PRAGMA table_info(web_sessions)").fetchall()}
-
-
-def _migrate_web_sessions_schema(conn) -> None:
-    """Add phase-3 columns to a batch-1 schema, idempotently.
-
-    Runs inside the caller's transaction (the store already opened
-    ``BEGIN IMMEDIATE``); never starts its own transaction.
-    """
-    existing = _web_sessions_columns(conn)
-    additions = {
-        "previous_refresh_valid_until": "TEXT",
-        "rotation_counter": "INTEGER NOT NULL DEFAULT 0",
-        "last_refreshed_at": "TEXT",
-        "revoke_reason": "TEXT",
-    }
-    missing = {name: ddl for name, ddl in additions.items() if name not in existing}
-    if not missing:
-        return
-    for name, ddl in missing.items():
-        conn.execute(f"ALTER TABLE web_sessions ADD COLUMN {name} {ddl}")
-    conn.execute("PRAGMA user_version = 2")

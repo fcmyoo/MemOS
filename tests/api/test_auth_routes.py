@@ -80,7 +80,7 @@ class _FakeArgon2Hasher:
 
 
 @pytest.fixture()
-def auth_env(tmp_path, monkeypatch):
+def auth_env(tmp_path, monkeypatch, postgres_test_schema):
     """App with injected auth services; clock frozen at EPOCH."""
     monkeypatch.delenv("REGISTRATION_MODE", raising=False)
     monkeypatch.delenv("WEB_CONSOLE_INVITE_CODE", raising=False)
@@ -88,7 +88,12 @@ def auth_env(tmp_path, monkeypatch):
     clock = FakeClock(start=EPOCH)
     db_path = str(tmp_path / "memos_users.db")
     user_manager = UserManager(db_path=db_path)
-    store = WebSessionStore(db_path=db_path, clock=clock)
+    store = WebSessionStore(
+        database_url=postgres_test_schema.url,
+        schema=postgres_test_schema.schema,
+        clock=clock,
+    )
+    postgres_test_schema.register(store.engine)
     tokens = WebTokenService(clock=clock)
     services = AuthServices(
         user_manager=user_manager,
@@ -118,6 +123,7 @@ def auth_env(tmp_path, monkeypatch):
 
     set_auth_services(None)
     user_manager.close()
+    store.close()
 
 
 def _register(client, user_name="alice", password=PASSWORD, invite_code=None):

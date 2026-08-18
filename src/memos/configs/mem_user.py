@@ -31,6 +31,15 @@ class MySQLUserManagerConfig(BaseUserManagerConfig):
     charset: str = Field(default="utf8mb4", description="MySQL charset")
 
 
+class PostgresUserManagerConfig(BaseUserManagerConfig):
+    """PostgreSQL user manager configuration.
+
+    Connection secrets (host, port, username, password, database) are not
+    copied into the config; they are read from the ``POSTGRES_*`` environment
+    variables at the connection layer.
+    """
+
+
 class RedisUserManagerConfig(BaseUserManagerConfig):
     """Redis user manager configuration."""
 
@@ -53,6 +62,7 @@ class UserManagerConfigFactory(BaseModel):
     backend_to_class: ClassVar[dict[str, Any]] = {
         "sqlite": SQLiteUserManagerConfig,
         "mysql": MySQLUserManagerConfig,
+        "postgres": PostgresUserManagerConfig,
         "redis": RedisUserManagerConfig,
     }
 

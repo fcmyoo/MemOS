@@ -17,7 +17,7 @@ from memos.api.product_models import (
     RegisterCubeResponseData,
 )
 from memos.log import get_logger
-from memos.mem_user.user_manager import UserManager
+from memos.mem_user.factory import create_runtime_user_manager
 
 
 logger = get_logger(__name__)
@@ -31,7 +31,7 @@ class CubeHandler(BaseHandler):
         super().__init__(*args, **kwargs)
         # Initialize UserManager for cube operations
         # Use graph_db as the backend for user/cube management
-        self.user_manager = UserManager()
+        self.user_manager = create_runtime_user_manager()
 
     async def create_cube(
         self, request: CreateCubeRequest, current_user: AuthContext | None = None

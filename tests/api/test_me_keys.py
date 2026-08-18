@@ -95,13 +95,18 @@ class _FakeConn:
 
 
 @pytest.fixture()
-def auth_env(tmp_path, monkeypatch):
+def auth_env(tmp_path, monkeypatch, postgres_test_schema):
     monkeypatch.delenv("REGISTRATION_MODE", raising=False)
 
     clock = FakeClock(start=EPOCH)
     db_path = str(tmp_path / "memos_users.db")
     user_manager = UserManager(db_path=db_path)
-    store = WebSessionStore(db_path=db_path, clock=clock)
+    store = WebSessionStore(
+        database_url=postgres_test_schema.url,
+        schema=postgres_test_schema.schema,
+        clock=clock,
+    )
+    postgres_test_schema.register(store.engine)
     tokens = WebTokenService(clock=clock)
     services = AuthServices(
         user_manager=user_manager,
@@ -132,6 +137,7 @@ def auth_env(tmp_path, monkeypatch):
 
     set_auth_services(None)
     user_manager.close()
+    store.close()
 
 
 def _register(client, user_name="alice", password=PASSWORD):
