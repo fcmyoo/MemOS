@@ -1197,6 +1197,52 @@ class Neo4jGraphDB(BaseGraphDB):
                 for record in result
             ]
 
+    def get_grouped_counts_by_day(
+        self,
+        user_name: str | None = None,
+        since_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Count nodes grouped by the UTC calendar day of ``created_at``.
+
+        ``created_at`` is stored as a Neo4j datetime (see ``add_node``), so the
+        day is derived server-side with ``date(n.created_at)`` instead of
+        exporting full nodes.  ``since_date`` (ISO ``YYYY-MM-DD``) optionally
+        restricts the result to days on or after that date.
+
+        Args:
+            user_name (str, optional): Tenant scope. Defaults to config.
+            since_date (str, optional): ISO day to start counting from.
+
+        Returns:
+            list[dict]: e.g., ``[{"day": "2026-07-20", "count": 12}, ...]``,
+            ordered by day ascending.  Days without writes are absent.
+        """
+        user_name = user_name if user_name else self.config.user_name
+
+        conditions = ["n.status <> 'deleted'"]
+        final_params: dict[str, Any] = {}
+        if since_date:
+            conditions.append("date(n.created_at) >= date($since_date)")
+            final_params["since_date"] = since_date
+        if not self.config.use_multi_db and (self.config.user_name or user_name):
+            conditions.append("n.user_name = $user_name")
+            final_params["user_name"] = user_name
+
+        query = f"""
+        MATCH (n:Memory)
+        WHERE {" AND ".join(conditions)}
+        RETURN toString(date(n.created_at)) AS day, COUNT(n) AS count
+        ORDER BY day
+        """
+
+        with self.driver.session(database=self.db_name) as session:
+            result = session.run(query, final_params)
+            return [
+                {"day": record["day"], "count": record["count"]}
+                for record in result
+            ]
+
     # Structure Maintenance
     def deduplicate_nodes(self) -> None:
         """

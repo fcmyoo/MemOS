@@ -360,3 +360,127 @@ def get_my_scheduler_status(principal: WebPrincipal = Depends(verify_web_access_
         "scheduler_summary": result.data.scheduler_summary,
         "all_tasks_summary": result.data.all_tasks_summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /me/memory-stats — aggregated memory usage for the console usage page.
+#
+# Reuses the cube resolution of /me/memories (principal's default cube; no
+# cube → empty stats) but returns only lightweight Neo4j GROUP BY aggregates,
+# so it never exports the full node set.  ``by_source`` is intentionally empty:
+# sync writes don't record agent_id yet (see
+# docs/plans/memory-usage-telemetry-input.md).  Each aggregate degrades to
+# empty/zero on error rather than failing the whole response.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/memory-stats")
+def get_my_memory_stats(principal: WebPrincipal = Depends(verify_web_access_token)) -> dict:
+    svc = _services()
+    user = svc.user_manager.get_user(principal.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="session_revoked")
+
+    empty = {
+        "total": 0,
+        "by_type": {},
+        "by_status": {},
+        "by_confidence": {"high": 0, "medium": 0, "low": 0},
+        "trend_30d": [],
+        "by_source": {},
+    }
+
+    cubes = svc.user_manager.get_user_cubes(user.user_id)
+    if not cubes:
+        return empty
+
+    cube_id = cubes[0].cube_id
+
+    # Lazy import (same pattern as /me/memories): server_router holds the heavy
+    # graph DB components initialised at import time.
+    from memos.api.routers import server_router
+
+    graph_store = server_router.naive_mem_cube.text_mem.graph_store
+
+    total = 0
+    by_type: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    by_confidence: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+    trend_30d: list[dict] = []
+
+    # Total + type distribution: one GROUP BY over memory_type covers both.
+    # ``total`` sums every row so it stays exact even for unknown/null types.
+    try:
+        type_rows = graph_store.get_grouped_counts(
+            group_fields=["memory_type"],
+            where_clause="WHERE n.status <> 'deleted'",
+            user_name=cube_id,
+        )
+        for row in type_rows or []:
+            count = int(row.get("count", 0))
+            total += count
+            mtype = row.get("memory_type")
+            if isinstance(mtype, str):
+                by_type[mtype] = count
+    except Exception:  # noqa: BLE001 - stats are best-effort
+        logger.warning("memory type stats unavailable: %s", exc_info=True)
+
+    # Status distribution (currently all 'activated', but cheap to keep generic).
+    try:
+        status_rows = graph_store.get_grouped_counts(
+            group_fields=["status"],
+            where_clause="WHERE n.status <> 'deleted'",
+            user_name=cube_id,
+        )
+        for row in status_rows or []:
+            status = row.get("status")
+            if isinstance(status, str):
+                by_status[status] = int(row.get("count", 0))
+    except Exception:  # noqa: BLE001 - stats are best-effort
+        logger.warning("memory status stats unavailable: %s", exc_info=True)
+
+    # Confidence buckets.  ``toFloat`` tolerates legacy string values while the
+    # current writer stores a 0~1 float.  Buckets: high >=0.8 / medium 0.5~0.8 / low <0.5.
+    try:
+        buckets = (
+            ("high", "WHERE toFloat(n.confidence) >= 0.8 AND n.status <> 'deleted'"),
+            (
+                "medium",
+                "WHERE toFloat(n.confidence) >= 0.5 AND toFloat(n.confidence) < 0.8"
+                " AND n.status <> 'deleted'",
+            ),
+            ("low", "WHERE toFloat(n.confidence) < 0.5 AND n.status <> 'deleted'"),
+        )
+        for bucket, clause in buckets:
+            rows = graph_store.get_grouped_counts(
+                group_fields=["status"],
+                where_clause=clause,
+                user_name=cube_id,
+            )
+            by_confidence[bucket] = sum(int(row.get("count", 0)) for row in rows or [])
+    except Exception:  # noqa: BLE001 - stats are best-effort
+        logger.warning("memory confidence stats unavailable: %s", exc_info=True)
+
+    # Daily write trend over the last 30 days, zero-filled so the frontend can
+    # render a continuous axis even when some days have no writes.
+    try:
+        today = datetime.utcnow().date()
+        days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(29, -1, -1)]
+        day_counts: dict[str, int] = {}
+        rows = graph_store.get_grouped_counts_by_day(user_name=cube_id, since_date=days[0])
+        for row in rows or []:
+            day = row.get("day")
+            if isinstance(day, str):
+                day_counts[day] = int(row.get("count", 0))
+        trend_30d = [{"date": d, "count": day_counts.get(d, 0)} for d in days]
+    except Exception:  # noqa: BLE001 - stats are best-effort
+        logger.warning("memory trend stats unavailable: %s", exc_info=True)
+
+    return {
+        "total": total,
+        "by_type": by_type,
+        "by_status": by_status,
+        "by_confidence": by_confidence,
+        "trend_30d": trend_30d,
+        "by_source": {},
+    }
