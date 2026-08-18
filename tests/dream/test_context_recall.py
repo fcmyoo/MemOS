@@ -64,7 +64,7 @@ def _handler(*, graph_db=None, embedder=None, cube_view=None) -> SearchHandler:
             embedder=embedder,
         )
     )
-    handler._build_cube_view = lambda _search_req: cube_view or FakeCubeView()
+    handler._build_cube_view = lambda _search_req, **kwargs: cube_view or FakeCubeView()
     return handler
 
 

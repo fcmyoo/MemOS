@@ -82,6 +82,8 @@ pymilvus==2.6.5
 PyMySQL==1.1.2
 pyperclip==1.11.0
 pytest==9.0.2
+pytest-asyncio==1.4.0
+markitdown[docx,pdf,pptx,xls,xlsx]==0.1.7
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
 python-multipart==0.0.20

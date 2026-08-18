@@ -26,8 +26,17 @@ RATE_LIMIT = int(os.getenv("RATE_LIMIT", "100"))  # Requests per window
 RATE_WINDOW = int(os.getenv("RATE_WINDOW_SEC", "60"))  # Window in seconds
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
+# Retry interval for reconnecting to Redis after a failed attempt (seconds).
+# A failed connect (e.g. DNS failure) can cost ~1.25s, so don't retry on every
+# request; cool down for this long before attempting again.
+_REDIS_RETRY_INTERVAL = 30.0
+
 # Redis client (lazy initialization)
 _redis_client = None
+
+# Negative cache: monotonic timestamp until which Redis is considered down.
+# time.monotonic() is used so system clock adjustments don't affect the window.
+_redis_unavailable_until = 0.0
 
 # In-memory fallback (per process)
 _memory_store: dict[str, list[float]] = defaultdict(list)
@@ -35,20 +44,32 @@ _memory_store: dict[str, list[float]] = defaultdict(list)
 
 def _get_redis():
     """Get or create Redis client."""
-    global _redis_client
+    global _redis_client, _redis_unavailable_until
     if _redis_client is not None:
         return _redis_client
+
+    # Negative cache: while cooling down after a failed attempt, skip the
+    # (slow, failing) connect+ping entirely and let callers use the in-memory
+    # fallback. Retry at most once per _REDIS_RETRY_INTERVAL so Redis can still
+    # be reconnected automatically once it comes back.
+    if time.monotonic() < _redis_unavailable_until:
+        return None
 
     try:
         import redis
 
-        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-        _redis_client.ping()  # Test connection
-        logger.info("Rate limiter connected to Redis")
-        return _redis_client
+        client = redis.from_url(REDIS_URL, decode_responses=True)
+        client.ping()  # Test connection
     except Exception as e:
+        _redis_client = None
+        _redis_unavailable_until = time.monotonic() + _REDIS_RETRY_INTERVAL
         logger.warning(f"Redis not available for rate limiting: {e}")
         return None
+
+    _redis_client = client
+    _redis_unavailable_until = 0.0
+    logger.info("Rate limiter connected to Redis")
+    return _redis_client
 
 
 def _get_client_key(request: Request) -> str:

@@ -21,6 +21,10 @@ ENV HF_ENDPOINT=https://hf-mirror.com
 COPY docker/requirements.txt .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
+# Copy pytest configuration (asyncio_mode=auto etc.) so in-container test runs
+# behave identically to the host/CI environment.
+COPY pyproject.toml .
+
 # Copy application code
 COPY docker/ ./docker/
 COPY src/ ./src/
