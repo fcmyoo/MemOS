@@ -104,6 +104,10 @@ def _client_ip(request: Request) -> str:
 
 _USER_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{3,32}$")
 
+#: Password must mix letters and digits (no minimum-length-only passwords).
+_PASSWORD_LETTER_RE = re.compile(r"[A-Za-z]")
+_PASSWORD_DIGIT_RE = re.compile(r"\d")
+
 #: Common passwords that are rejected outright (sample list).
 _COMMON_PASSWORDS = {
     "password",
@@ -128,10 +132,12 @@ def _validate_user_name(user_name: str) -> str | None:
 
 
 def _validate_password(password: str) -> str | None:
-    if not isinstance(password, str) or not (12 <= len(password) <= 128):
+    if not isinstance(password, str) or not (6 <= len(password) <= 128):
         return "invalid_password_length"
     if password.lower() in _COMMON_PASSWORDS:
         return "weak_password"
+    if not _PASSWORD_LETTER_RE.search(password) or not _PASSWORD_DIGIT_RE.search(password):
+        return "invalid_password_composition"
     return None
 
 

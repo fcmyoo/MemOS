@@ -74,6 +74,33 @@ def download_examples(dest: str) -> bool:
     return True
 
 
+def set_root_password(password: str) -> bool:
+    """Set the root user's Web console password (Argon2id, via PostgreSQL)."""
+    from memos.api.web_auth import WebPasswordService
+    from memos.mem_user.factory import create_runtime_user_manager
+
+    if len(password) < 6 or not any(c.isalpha() for c in password) or not any(c.isdigit() for c in password):
+        print("❌ Password must be at least 6 characters and contain both letters and digits.")
+        return False
+
+    user_manager = create_runtime_user_manager()
+    try:
+        user = user_manager.get_user_by_name("root")
+        if user is None:
+            print("❌ Root user 'root' not found.")
+            return False
+
+        password_hash = WebPasswordService().hash_password(password)
+        if not user_manager.set_user_password(user.user_id, password_hash):
+            print("❌ Failed to set root password.")
+            return False
+    finally:
+        user_manager.close()
+
+    print("✅ Root password set successfully.")
+    return True
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -102,6 +129,17 @@ def main():
         help="Output path for OpenAPI schema (default: openapi.json)",
     )
 
+    # Set root password command
+    root_pwd_parser = subparsers.add_parser(
+        "set_root_password", help="Set the root user's Web console password"
+    )
+    root_pwd_parser.add_argument(
+        "--password",
+        type=str,
+        required=True,
+        help="New password for the root user (minimum 6 characters, letters + digits)",
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -111,6 +149,9 @@ def main():
         exit(0 if success else 1)
     elif args.command == "export_openapi":
         success = export_openapi(args.output)
+        exit(0 if success else 1)
+    elif args.command == "set_root_password":
+        success = set_root_password(args.password)
         exit(0 if success else 1)
     else:
         parser.print_help()
