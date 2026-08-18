@@ -12,10 +12,11 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from memos.api.middleware.auth import WebPrincipal, verify_web_access_token
+from memos.api.product_models import TaskSummary
 from memos.api.utils.api_keys import (
     create_api_key_in_db,
     list_api_keys,
@@ -221,3 +222,141 @@ def revoke_my_key(
         # Not found / not yours / already revoked all look the same.
         raise HTTPException(status_code=403, detail="key_not_available")
     return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------------------
+# GET /me/memories — the caller's own memories, flattened for the console.
+#
+# Web sessions carry a ``wca_`` bearer that resolves to a WebPrincipal; the
+# product memory handlers, by contrast, are gated behind the API-key
+# ``verify_api_key`` / ``CubeAccessControl`` path.  This endpoint bridges the
+# two: it resolves the caller's *own* default cube from the principal (never
+# from the request body) and reads that cube's text memories directly through
+# the shared ``naive_mem_cube`` component, then strips embedding vectors so
+# the console never receives a 1024-dim payload it cannot use.
+# ---------------------------------------------------------------------------
+
+
+def _strip_embeddings(memories: list[dict]) -> list[dict]:
+    """Return memory nodes with ``metadata.embedding`` removed recursively."""
+    cleaned: list[dict] = []
+    for node in memories:
+        copy = dict(node)
+        meta = copy.get("metadata")
+        if isinstance(meta, dict):
+            meta_copy = dict(meta)
+            meta_copy.pop("embedding", None)
+            copy["metadata"] = meta_copy
+        cleaned.append(copy)
+    return cleaned
+
+
+@router.get("/memories")
+def list_my_memories(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    memory_type: str | None = Query(default=None),
+    principal: WebPrincipal = Depends(verify_web_access_token),
+) -> dict:
+    svc = _services()
+    user = svc.user_manager.get_user(principal.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="session_revoked")
+
+    _ALL_MEMORY_TYPES = ["WorkingMemory", "LongTermMemory", "UserMemory", "OuterMemory"]
+    text_memory_type = _ALL_MEMORY_TYPES
+    if memory_type:
+        if memory_type not in _ALL_MEMORY_TYPES:
+            raise HTTPException(status_code=422, detail="invalid_memory_type")
+        text_memory_type = [memory_type]
+
+    cubes = svc.user_manager.get_user_cubes(user.user_id)
+    if not cubes:
+        return {"memories": [], "total": 0, "cube_id": None}
+
+    cube_id = cubes[0].cube_id
+
+    # Lazy import: server_router initialises the heavy components (LLM,
+    # graph DB, embedder, ...) at module import.  server_api.py imports
+    # server_router before me_router, so these globals are already live here
+    # and a lazy import inside the endpoint keeps the router import-light.
+    from memos.api.routers import server_router
+
+    naive_mem_cube = server_router.naive_mem_cube
+    text_memories_info = naive_mem_cube.text_mem.get_all(
+        user_name=cube_id,
+        user_id=user.user_id,
+        memory_type=text_memory_type,
+        page=page,
+        page_size=page_size,
+    )
+    nodes = text_memories_info["nodes"] if isinstance(text_memories_info, dict) else []
+    total = (
+        text_memories_info.get("total_nodes", len(nodes))
+        if isinstance(text_memories_info, dict)
+        else len(nodes)
+    )
+
+    # Type distribution over ALL memories (not just the current page) so the
+    # usage page's bar chart stays correct regardless of pagination.  Uses a
+    # lightweight Neo4j GROUP BY (count per memory_type) instead of exporting
+    # every node, so pagination stays fast. Failures degrade to empty stats
+    # rather than blocking the list.
+    type_counts: dict[str, int] = {}
+    try:
+        rows = naive_mem_cube.text_mem.graph_store.get_grouped_counts(
+            group_fields=["memory_type"],
+            where_clause=(
+                "WHERE n.memory_type IN $memory_types AND n.status <> 'deleted'"
+            ),
+            params={"memory_types": text_memory_type},
+            user_name=cube_id,
+        )
+        for row in rows or []:
+            mtype = row.get("memory_type")
+            if isinstance(mtype, str):
+                type_counts[mtype] = int(row.get("count", 0))
+    except Exception:  # noqa: BLE001 - stats are best-effort
+        logger.warning("memory type stats unavailable: %s", exc_info=True)
+
+    return {
+        "memories": _strip_embeddings(nodes),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "cube_id": cube_id,
+        "stats": {"by_type": type_counts},
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /me/scheduler — aggregated scheduler status for the overview console.
+#
+# Mirrors /product/scheduler/allstatus but is gated behind the web-session
+# bearer (``wca_``) instead of an API key.  Scheduler state is global rather
+# than per-user, so any authenticated console user may read it.  The heavy
+# scheduler components live on server_router and are imported lazily, keeping
+# this router import-light (same pattern as /me/memories).
+# ---------------------------------------------------------------------------
+
+
+@router.get("/scheduler")
+def get_my_scheduler_status(principal: WebPrincipal = Depends(verify_web_access_token)) -> dict:
+    from memos.api.handlers import scheduler_handler
+    from memos.api.routers import server_router
+
+    mem_scheduler = server_router.mem_scheduler
+    status_tracker = server_router.status_tracker
+
+    # Scheduler not enabled: report an all-zero summary instead of erroring.
+    if mem_scheduler is None or status_tracker is None:
+        empty = TaskSummary()
+        return {"scheduler_summary": empty, "all_tasks_summary": empty}
+
+    result = scheduler_handler.handle_scheduler_allstatus(
+        mem_scheduler=mem_scheduler, status_tracker=status_tracker
+    )
+    return {
+        "scheduler_summary": result.data.scheduler_summary,
+        "all_tasks_summary": result.data.all_tasks_summary,
+    }
