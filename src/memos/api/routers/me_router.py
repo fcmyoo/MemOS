@@ -251,6 +251,60 @@ def _strip_embeddings(memories: list[dict]) -> list[dict]:
     return cleaned
 
 
+def _infer_source_type(sources: list | None) -> str | None:
+    """Return the source kind (e.g. ``chat``) from ``metadata.sources``."""
+    if not sources:
+        return None
+
+    def _type_of(source) -> str | None:
+        if isinstance(source, dict):
+            return source.get("type")
+        return getattr(source, "type", None)
+
+    first = _type_of(sources[0])
+    if first:
+        return first
+
+    counts: dict[str, int] = {}
+    for source in sources:
+        stype = _type_of(source)
+        if stype:
+            counts[stype] = counts.get(stype, 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+def _enrich_source_metadata(node: dict) -> dict:
+    """Fill normalized ``metadata.agent_id`` / ``metadata.source_type``.
+
+    Sync writes stamp the source agent on the ``session_id`` colon prefix
+    (``codex:codex:rollout-...`` → ``codex``) and the source kind on
+    ``metadata.sources[].type``; lift both into the fields the console reads.
+    Only fills these two fields — everything else is left untouched.
+    """
+    meta = node.get("metadata")
+    if not isinstance(meta, dict):
+        return node
+
+    enriched = dict(meta)
+
+    session_id = enriched.get("session_id")
+    if isinstance(session_id, str) and ":" in session_id:
+        prefix = session_id.split(":", 1)[0]
+        if prefix:
+            enriched["agent_id"] = prefix
+
+    source_type = _infer_source_type(enriched.get("sources"))
+    if source_type is not None:
+        enriched["source_type"] = source_type
+
+    if enriched == meta:
+        return node
+
+    copy = dict(node)
+    copy["metadata"] = enriched
+    return copy
+
+
 @router.get("/memories")
 def list_my_memories(
     page: int = Query(default=1, ge=1),
@@ -319,8 +373,9 @@ def list_my_memories(
     except Exception:  # noqa: BLE001 - stats are best-effort
         logger.warning("memory type stats unavailable: %s", exc_info=True)
 
+    enriched_nodes = [_enrich_source_metadata(node) for node in nodes]
     return {
-        "memories": _strip_embeddings(nodes),
+        "memories": _strip_embeddings(enriched_nodes),
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -476,11 +531,30 @@ def get_my_memory_stats(principal: WebPrincipal = Depends(verify_web_access_toke
     except Exception:  # noqa: BLE001 - stats are best-effort
         logger.warning("memory trend stats unavailable: %s", exc_info=True)
 
+    # Source (agent) distribution.  The sync pipeline stamps a "<source>:<sid>"
+    # prefix on session_id, so we bucket by the part before the first ':'.
+    # Legacy/default entries (session_id == "default_session") land in "other".
+    try:
+        source_rows = graph_store.get_grouped_counts(
+            group_fields=["session_id"],
+            where_clause="WHERE n.status <> 'deleted'",
+            user_name=cube_id,
+        )
+        counts: dict[str, int] = {}
+        for row in source_rows or []:
+            sid = row.get("session_id")
+            cnt = int(row.get("count", 0))
+            src = str(sid).split(":", 1)[0] if isinstance(sid, str) and ":" in sid else "other"
+            counts[src] = counts.get(src, 0) + cnt
+        by_source = dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+    except Exception:  # noqa: BLE001 - stats are best-effort
+        by_source = {}
+
     return {
         "total": total,
         "by_type": by_type,
         "by_status": by_status,
         "by_confidence": by_confidence,
         "trend_30d": trend_30d,
-        "by_source": {},
+        "by_source": by_source,
     }
