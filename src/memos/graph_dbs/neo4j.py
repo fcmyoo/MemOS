@@ -1870,6 +1870,27 @@ class Neo4jGraphDB(BaseGraphDB):
                             param_counter[0] += 1
                             params[param_name] = op_value
                             condition_parts.append(f"{node_alias}.{key} IN ${param_name}")
+                        elif op == "not_in":
+                            # Handle not_in operator: field value is absent from the list.
+                            # Supports array format: {"field": {"not_in": ["value1", "value2"]}}
+                            if not isinstance(op_value, list):
+                                raise ValueError(
+                                    f"not_in operator only supports array format. "
+                                    f"Use {{'{key}': {{'not_in': ['{op_value}']}}}} instead of "
+                                    f"{{'{key}': {{'not_in': '{op_value}'}}}}"
+                                )
+                            param_name = f"filter_{key}_{op}_{param_counter[0]}"
+                            param_counter[0] += 1
+                            params[param_name] = op_value
+                            # Cypher's `NOT x IN y` propagates NULL when x is NULL, which
+                            # would silently exclude nodes with a missing property from a
+                            # "not in" filter. Treat a missing/null property as satisfying
+                            # "not in the list" explicitly (e.g. an unset memory_layer is
+                            # "not one of L1/L2/L3/Skill").
+                            condition_parts.append(
+                                f"({node_alias}.{key} IS NULL OR "
+                                f"NOT {node_alias}.{key} IN ${param_name})"
+                            )
                         elif op == "like":
                             # Handle like operator (for fuzzy matching, similar to SQL LIKE '%value%')
                             # Neo4j uses CONTAINS for string matching
