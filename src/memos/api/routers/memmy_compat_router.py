@@ -62,7 +62,6 @@ def memory_add(
     memmy_id = "memmy_compat_" + uuid.uuid4().hex[:16]
     add_req = server_router.APIADDRequest(
         user_id=actor.user_id,  # 真实 user_id → resolve_actor 校验通过（与 key 绑定用户一致）
-        memory_type=_LAYER_TO_TYPE[req.layer],
         messages=[
             {"role": "user", "content": f"『源:{req.source}:{memmy_id}』\n{req.content}"}
         ],
@@ -74,9 +73,24 @@ def memory_add(
             "source": req.source or "hermes",
         },
         async_mode="sync",
+        mode="fast",  # P0-3：显式设置 fast 模式（sync + fast = 原文直存不走 LLM）
     )
     result = server_router.add_handler.handle_add_memories(add_req, current_user)
-    return {"id": memmy_id, "layer": req.layer, "content": req.content, "result": str(result)[:200]}
+    result_str = str(result)
+    # 从 handler 结果提取真实节点 id（data=[{memory, memory_id, ...}]）
+    import re as _re
+
+    real_id_m = _re.search(r"'memory_id':\s*'([0-9a-f-]{36})'", result_str)
+    if not real_id_m:
+        real_id_m = _re.search(r'"memory_id":\s*"([0-9a-f-]{36})"', result_str)
+    return {
+        "id": real_id_m.group(1) if real_id_m else memmy_id,
+        "memmy_id": memmy_id,
+        "layer": req.layer,
+        "content": req.content,
+        "fast": True,
+        "result": result_str[:200],
+    }
 
 
 @router.post("/memory/search")
@@ -111,10 +125,11 @@ def memory_search(
         dedup="sim",
     )
     try:
-        result = search_handler.handle_search_memories(search_req)
+        result = search_handler.handle_search_memories(search_req, current_user)
         data = result.data or {}
         results = []
-        for it in data.get("items", data.get("memories", [])):
+        # P0-2：适配真实返回键 text_mem（single_cube.py:109-133），保留 items/memories 兼容
+        for it in data.get("text_mem", data.get("items", data.get("memories", []))):
             meta = it.get("metadata") or {}
             results.append(
                 {
@@ -125,11 +140,15 @@ def memory_search(
                 }
             )
         return {"items": results}
-    except Exception as exc:  # noqa: BLE001
+    except HTTPException:
+        # P0-2：HTTPException 直接向上抛（401/403 等认证/授权异常）
+        raise
+    except (ValueError, KeyError, AttributeError) as exc:
+        # P0-2：收窄为预期检索异常（数据结构/参数/字段访问异常），记录日志
         from memos.log import get_logger
 
-        get_logger(__name__).warning("memmy-compat search failed: %s", exc)
-        return {"items": []}
+        get_logger(__name__).warning("memmy-compat search failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="search_failed") from exc
 
 
 @router.get("/memory/{memory_id}")
@@ -137,8 +156,39 @@ def memory_get(
     memory_id: str,
     current_user: AuthContext = Depends(get_current_user),
 ) -> dict:
-    """按 id 取单条记忆（API key 鉴权）。"""
-    raise HTTPException(status_code=404, detail="memory_not_found")
+    """按 id 取单条记忆（API key 鉴权）。P0-1：真实现，owner 校验，不存在/越权统一 404。"""
+    from memos.api.routers import me_router
+
+    user_name = current_user.get("user_name") or "default"
+    # 通过 user_name 找用户 cube（API key 身份是 user_name）
+    svc = me_router._services()
+    user = svc.user_manager.get_user_by_name(user_name)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="user_inactive")
+    cubes = svc.user_manager.get_user_cubes(user.user_id)
+    if not cubes:
+        raise HTTPException(status_code=404, detail="memory_not_found")
+
+    # 用 server_router 的 naive_mem_cube（模块级实例，与 /me/memories 同源）。
+    # 注意：Neo4j 节点的 user_name 属性存的是 user_id（非 cube_id），
+    # 传 actor.user_id 精确命中（与 /me/memories 查询口径一致）。
+    from memos.api.routers import server_router
+
+    node = server_router.naive_mem_cube.text_mem.graph_store.get_node(
+        memory_id, include_embedding=False, user_name=user.user_id
+    )
+    if node is None:
+        # 未找到或越权（不区分，统一 404）
+        raise HTTPException(status_code=404, detail="memory_not_found")
+    meta = node.get("metadata") or {}
+    return {
+        "id": node.get("id", memory_id),
+        "content": str(node.get("memory", "")),
+        "layer": meta.get("memory_layer", "L1"),
+        "key": meta.get("stable_key", ""),
+        "tags": meta.get("tags", []),
+        "createdAt": meta.get("created_at", ""),
+    }
 
 
 class SessionOpenRequest(BaseModel):
