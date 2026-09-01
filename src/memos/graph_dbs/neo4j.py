@@ -1609,6 +1609,7 @@ class Neo4jGraphDB(BaseGraphDB):
             MATCH (n:Memory)
             {where_clause}
             RETURN n.id AS id, n AS node
+            ORDER BY n.created_at ASC
             """
 
         with self.driver.session(database=self.db_name) as session:

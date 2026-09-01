@@ -20,6 +20,7 @@ from memos.api.middleware.security import SecurityHeadersMiddleware
 from memos.api.routers import server_router as server_router_module
 from memos.api.routers.admin_router import router as admin_router
 from memos.api.routers.auth_router import WebAuthHTTPError
+from memos.api.routers.memmy_compat_router import router as memmy_compat_router
 from memos.plugins.manager import plugin_manager
 
 
@@ -121,6 +122,7 @@ if AUTH_ENABLED:
     app.add_exception_handler(WebAuthHTTPError, web_auth_error_handler)
     app.include_router(web_auth_router)
     app.include_router(me_router)
+    app.include_router(memmy_compat_router)
 
 
 @app.get("/health")

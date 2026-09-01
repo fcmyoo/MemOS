@@ -93,13 +93,15 @@ class GraphStructureReorganizer:
 
         self.is_reorganize = is_reorganize
         self._reorganize_needed = True
+        # 状态无条件初始化：optimize_structure 依赖 _is_optimizing，
+        # 与 is_reorganize 开关解耦（测试/手动调用路径也需要）
+        self._stop_scheduler = False
+        self._is_optimizing = {"LongTermMemory": False, "UserMemory": False}
         if self.is_reorganize:
             # ____ 1. For queue message driven thread ___________
             self.thread = ContextThread(target=self._run_message_consumer_loop)
             self.thread.start()
             # ____ 2. For periodic structure optimization _______
-            self._stop_scheduler = False
-            self._is_optimizing = {"LongTermMemory": False, "UserMemory": False}
             self.structure_optimizer_thread = ContextThread(
                 target=self._run_structure_organizer_loop
             )
@@ -107,6 +109,28 @@ class GraphStructureReorganizer:
 
     def add_message(self, message: QueueMessage):
         self.queue.put_nowait(message)
+
+    def _list_active_user_names(self) -> list[str]:
+        """定时调度的用户范围：库中实际存在记忆的 user_name（即 user_id）。"""
+        try:
+            with self.graph_store.driver.session(database=self.graph_store.db_name) as session:
+                rows = session.run(
+                    "MATCH (n:Memory) WHERE n.status = 'activated' "
+                    "RETURN DISTINCT n.user_name AS u LIMIT 50"
+                ).data()
+            return [r["u"] for r in rows if r.get("u")]
+        except Exception:
+            logger.warning("[GraphStructureReorganize] list active users failed", exc_info=True)
+            return []
+
+    def _optimize_all_users(self, scope: str, **kwargs) -> None:
+        """对库中每个有记忆的用户各跑一轮结构优化。
+
+        optimize_structure 的候选查询按 user_name 过滤（该属性存 user_id），
+        调度路径不传用户会回落到 config 默认值（不在库中）→ 永远 0 候选。
+        """
+        for user_name in self._list_active_user_names():
+            self.optimize_structure(scope=scope, user_name=user_name, **kwargs)
 
     def wait_until_current_task_done(self):
         """
@@ -155,18 +179,19 @@ class GraphStructureReorganizer:
         """
         import schedule
 
-        schedule.every(100).seconds.do(self.optimize_structure, scope="LongTermMemory")
-        schedule.every(100).seconds.do(self.optimize_structure, scope="UserMemory")
+        schedule.every(100).seconds.do(self._optimize_all_users, scope="LongTermMemory")
+        schedule.every(100).seconds.do(self._optimize_all_users, scope="UserMemory")
 
         logger.info("Structure optimizer schedule started.")
         while not getattr(self, "_stop_scheduler", False):
+            schedule.run_pending()  # Drive schedule tasks (without this, registered tasks never execute)
             if any(self._is_optimizing.values()):
                 time.sleep(1)
                 continue
             if self._reorganize_needed:
                 logger.info("[Reorganizer] Triggering optimize_structure due to new nodes.")
-                self.optimize_structure(scope="LongTermMemory")
-                self.optimize_structure(scope="UserMemory")
+                self._optimize_all_users(scope="LongTermMemory")
+                self._optimize_all_users(scope="UserMemory")
                 self._reorganize_needed = False
             time.sleep(30)
 
@@ -214,6 +239,7 @@ class GraphStructureReorganizer:
         local_tree_threshold: int = 10,
         min_cluster_size: int = 4,
         min_group_size: int = 20,
+        max_candidates: int = 40,
         max_duration_sec: int = 600,
         user_name: str | None = None,
     ):
@@ -259,6 +285,12 @@ class GraphStructureReorganizer:
             raw_nodes = self.graph_store.get_structure_optimization_candidates(
                 scope, user_name=user_name
             )
+            # 分批消化：大库积压数万孤立候选时，一次全量聚类必然超过
+            # max_duration_sec 看门狗（实测 55713 个被静默取消）。每轮只取
+            # 最旧的 max_candidates 个，多轮调度逐步消化积压。
+            # 查询已按 created_at ASC 排序，这里直接取前 max_candidates 即最旧的。
+            if len(raw_nodes) > max_candidates:
+                raw_nodes = raw_nodes[:max_candidates]  # 取最旧的批次
             nodes = [GraphDBNode(**n) for n in raw_nodes]
 
             if not nodes:
@@ -591,6 +623,10 @@ class GraphStructureReorganizer:
                 background=parent_background,
                 confidence=0.66,
                 type="topic",
+                # 方案 2：聚类摘要父节点 = L2 归纳层（policy/主题归纳）。
+                # TextualMemoryMetadata extra="allow"，字段会持久化到 Neo4j 顶层属性，
+                # 与 memmy 同步记忆的 memory_layer 口径一致，前端按层筛选即可命中。
+                memory_layer="L2",
             ),
         )
         return parent_node
@@ -655,5 +691,16 @@ class GraphStructureReorganizer:
                 logger.debug(f"Node with ID {node} not found in the graph store.")
                 message.after_node[i] = None
             else:
+                # 存量数据兼容：metadata.internal_info 可能被存成 JSON 字符串
+                # （与 dream/contextualization._coerce_json_dict 同一问题），
+                # GraphDBNode 校验要求 dict，先归一化避免消费循环死循环报错。
+                metadata = raw_node.get("metadata")
+                if isinstance(metadata, dict):
+                    internal_info = metadata.get("internal_info")
+                    if isinstance(internal_info, str) and internal_info.strip().startswith("{"):
+                        try:
+                            metadata["internal_info"] = json.loads(internal_info)
+                        except json.JSONDecodeError:
+                            metadata["internal_info"] = {}
                 message.after_node[i] = GraphDBNode(**raw_node)
         return message

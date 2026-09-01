@@ -50,6 +50,7 @@ dependencies = [
     "prometheus-client (>=0.23.1,<0.24.0)",
     "concurrent-log-handler (>=0.9.28,<1.0.0)",  # Process-safe rotating file handler
     "cachetools (>=6.0.0)",  # Embedding request caching
+    "schedule (>=1.2.2,<2.0.0)",  # Task scheduling for reorganizer
 ]
 
 [project.urls]

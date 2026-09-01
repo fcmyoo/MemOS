@@ -85,6 +85,7 @@ pytest==9.0.2
 pytest-asyncio==1.4.0
 markitdown[docx,pdf,pptx,xls,xlsx]==0.1.7
 python-dateutil==2.9.0.post0
+schedule==1.2.2
 python-dotenv==1.2.1
 python-multipart==0.0.20
 pytz==2025.2
