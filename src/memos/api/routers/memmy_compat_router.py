@@ -269,7 +269,6 @@ def skill_evidence_add(
     鉴权：API key（current_user 绑定的用户），只能为自己的 L3 节点添加 evidence。
     """
     from datetime import datetime, timezone
-    import json as _json
 
     from memos.api.routers import me_router, server_router
 

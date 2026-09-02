@@ -581,3 +581,61 @@ class TestInductionResilience:
         assert result is None
         assert not embedder.embed.called
 
+    def test_null_skill_key_returns_none(self, mock_components):
+        """LLM 返回 skill_key=null → 返回 None 且不调用 embedder.embed（第三轮复核阻断项1）。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        l3_node = self._make_world_node("world_0")
+
+        with patch.object(
+            reorganizer,
+            "_parse_json_result",
+            return_value={"skill_key": None, "skill_value": "步骤", "gain_self_eval": 0.9}
+        ):
+            result = reorganizer._summarize_skill(l3_node)
+
+        assert result is None
+        assert not embedder.embed.called
+
+    def test_nonstring_skill_value_returns_none(self, mock_components):
+        """LLM 返回 skill_value=list → 返回 None 且不调用 embedder.embed（第三轮复核阻断项1）。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        l3_node = self._make_world_node("world_0")
+
+        with patch.object(
+            reorganizer,
+            "_parse_json_result",
+            return_value={"skill_key": "k", "skill_value": ["a", "b"], "gain_self_eval": 0.9}
+        ):
+            result = reorganizer._summarize_skill(l3_node)
+
+        assert result is None
+        assert not embedder.embed.called
+
+    def test_mixed_evidence_log_format_preserves_all(self, mock_components):
+        """混合格式 evidence_log（旧整体串+新逐条串）→ 全部保留（第三轮复核阻断项2）。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        l3_node = self._make_world_node("world_0")
+        # 旧格式：整体 JSON 串含 2 条 + 新格式：逐条串 1 条
+        l3_node.metadata.skill_evidence_log = [
+            '[{"at": "t1", "note": "old1"}, {"at": "t2", "note": "old2"}]',
+            '{"at": "t3", "note": "new1"}'
+        ]
+
+        with patch.object(
+            reorganizer,
+            "_parse_json_result",
+            return_value={"skill_key": "k", "skill_value": "v", "gain_self_eval": 0.9}
+        ):
+            embedder.embed.return_value = [[0.1] * 128]
+            skill_node = reorganizer._summarize_skill(l3_node)
+
+        assert skill_node is not None
+        # evidence_count 回落 len(evidence_log)，验证旧 2 条未丢
+        assert skill_node.metadata.skill_evidence_count == 3
+

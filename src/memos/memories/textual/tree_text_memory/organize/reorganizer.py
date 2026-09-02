@@ -819,7 +819,7 @@ class GraphStructureReorganizer:
                 "[Reorganizer] induce_world_models user=%s: no unconsumed L2 policies.",
                 user_name,
             )
-            return
+            return []
 
         # WARNING 级：生产日志仅 WARNING 可见（log.py:33），关键数字必须在此可观察
         logger.warning(
@@ -1025,7 +1025,7 @@ class GraphStructureReorganizer:
                 "[Reorganizer] induce_skills user=%s: no evidence-qualified L3 world models.",
                 user_name,
             )
-            return
+            return []
 
         # WARNING 级：生产日志仅 WARNING 可见（log.py:33），关键数字必须在此可观察
         logger.warning(
@@ -1099,10 +1099,13 @@ class GraphStructureReorganizer:
             elif isinstance(item, str):
                 try:
                     obj = json.loads(item)
-                    if isinstance(obj, dict):
-                        normalized.append(obj)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(obj, dict):
+                    normalized.append(obj)
+                elif isinstance(obj, list):
+                    # 旧格式：整体 JSON 串解包出的 list，展开其中合法 dict 条目
+                    normalized.extend([x for x in obj if isinstance(x, dict)])
         evidence_log = normalized
 
         evidence_items_text = "\n".join(
@@ -1139,12 +1142,14 @@ class GraphStructureReorganizer:
             )
             return None
 
-        skill_key = str(response_json.get("skill_key", "")).strip()
-        skill_value = str(response_json.get("skill_value", "")).strip()
-
+        raw_skill_key = response_json.get("skill_key")
+        raw_skill_value = response_json.get("skill_value")
+        skill_key = raw_skill_key.strip() if isinstance(raw_skill_key, str) else ""
+        skill_value = raw_skill_value.strip() if isinstance(raw_skill_value, str) else ""
         if not skill_key or not skill_value:
             logger.warning(
-                "[Reorganizer] LLM returned empty skill_key/skill_value for L3 (id=%s), skip skill induction.",
+                "[Reorganizer] LLM returned empty/non-string skill_key/skill_value for L3 (id=%s), "
+                "skip skill induction.",
                 l3_node.id,
             )
             return None
