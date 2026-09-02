@@ -86,7 +86,7 @@ class GraphStructureReorganizer:
     # - SEMANTIC_THRESHOLD：簇内节点与锚点的余弦相似度门槛，剔除"时间相邻但语义无关"的节点
     # - MIN_POLICY_EVIDENCE：归纳 policy 所需的最少有效证据（节点）数，低于此不调用 LLM
     # - MIN_POLICY_GAIN：LLM 自评 gain_self_eval 门槛，低于此丢弃归纳结果（不生成 L2）
-    SEMANTIC_THRESHOLD = 0.75
+    SEMANTIC_THRESHOLD = 0.5
     MIN_POLICY_EVIDENCE = 3
     MIN_POLICY_GAIN = 0.3
 
@@ -380,7 +380,7 @@ class GraphStructureReorganizer:
         # 仅用于 L2 归纳路径；下方 relation/reasoning 检测仍对原始 cluster_nodes 生效。
         semantic_nodes = self._semantic_filter(cluster_nodes)
         if len(semantic_nodes) < min_cluster_size:
-            logger.info(
+            logger.warning(
                 "[Reorganizer] semantic filter kept %s/%s nodes (< min_cluster_size=%s), "
                 "skip L2 induction this round (nodes stay isolated to accumulate).",
                 len(semantic_nodes), len(cluster_nodes), min_cluster_size,
