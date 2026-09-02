@@ -409,39 +409,31 @@ class Neo4jGraphDB(BaseGraphDB):
         with self.driver.session(database=self.db_name) as session:
             session.run(query, **params)
 
-    def increment_node_field(self, id: str, field: str, increment: int = 1, extra_fields: dict[str, Any] | None = None, user_name: str | None = None) -> int | None:
-        """原子递增节点的数值字段（DB 侧 coalesce+increment，无读改写竞态）。
+    def add_skill_evidence_atomic(
+        self, id: str, note_entry: dict[str, Any], user_name: str | None = None
+    ) -> int | None:
+        """原子添加 skill evidence：计数+1 与日志追加在同一写事务内完成。
 
-        extra_fields 同一事务合并写入（如 evidence log 追加）。
-        返回递增后的新值；节点不存在返回 None。
+        存储格式：skill_evidence_log 为 JSON 字符串列表（Neo4j 属性不支持嵌套 map，
+        故每条 entry 序列化为 JSON 字符串后拼接）。历史遗留的"整体 JSON 字符串"格式
+        由读方 _summarize_skill 兼容；写前需一次性迁移（或节点从空列表起步）。
+        返回更新后的计数；节点不存在返回 None。
         """
-        ALLOWED_INCREMENT_FIELDS = {"skill_evidence_count"}
-        if field not in ALLOWED_INCREMENT_FIELDS:
-            raise ValueError(f"Field not allowed for atomic increment: {field}")
-
         user_name = user_name if user_name else self.config.user_name
-
+        entry_str = json.dumps(note_entry, ensure_ascii=False)
         query = """
         MATCH (n:Memory {id: $id})
         """
-        params = {"id": id, "inc": increment}
-
         if not self.config.use_multi_db and (self.config.user_name or user_name):
             query += "\nWHERE n.user_name = $user_name"
-            params["user_name"] = user_name
-
-        query += f"\nSET n.{field} = coalesce(n.{field}, 0) + $inc"
-
-        if extra_fields:
-            query += ",\n    n += $extra"
-            params["extra"] = extra_fields
-
-        query += f"\nRETURN n.{field} AS new_value"
-
+        query += """
+        SET n.skill_evidence_count = coalesce(n.skill_evidence_count, 0) + 1,
+            n.skill_evidence_log = coalesce(n.skill_evidence_log, []) + $entry
+        RETURN n.skill_evidence_count AS new_count
+        """
         with self.driver.session(database=self.db_name) as session:
-            result = session.run(query, **params)
-            record = result.single()
-            return record["new_value"] if record else None
+            record = session.run(query, id=id, entry=[entry_str], user_name=user_name).single()
+            return record["new_count"] if record else None
 
     def delete_node(self, id: str, user_name: str | None = None) -> None:
         """

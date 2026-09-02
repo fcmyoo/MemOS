@@ -564,3 +564,20 @@ class TestInductionResilience:
         assert skill_node is not None
         assert skill_node.metadata.skill_evidence_count == len(evidence_log)
 
+    def test_empty_skill_key_returns_none(self, mock_components):
+        """LLM 返回空 skill_key/skill_value → 返回 None 且不调用 embedder.embed（复核 P2 闭环）。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        l3_node = self._make_world_node("world_0")
+
+        # Mock LLM 返回空 skill_key
+        llm.generate.return_value = (
+            '{"skill_key": "", "skill_value": "步骤1、步骤2", "gain_self_eval": 0.9}'
+        )
+
+        result = reorganizer._summarize_skill(l3_node)
+
+        assert result is None
+        assert not embedder.embed.called
+

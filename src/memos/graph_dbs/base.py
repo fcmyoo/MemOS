@@ -51,6 +51,14 @@ class BaseGraphDB(ABC):
             user_name: given user_name
         """
 
+    def add_skill_evidence_atomic(
+        self, id: str, note_entry: dict[str, Any], user_name: str | None = None
+    ) -> int | None:
+        """原子添加 skill evidence（计数+1 与日志追加同事务）。默认不支持。"""
+        raise NotImplementedError(
+            "This graph backend does not support atomic skill evidence append."
+        )
+
     @abstractmethod
     def delete_node(self, id: str) -> None:
         """

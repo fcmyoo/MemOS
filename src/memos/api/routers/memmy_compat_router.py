@@ -294,27 +294,13 @@ def skill_evidence_add(
             detail="not_world_model: evidence can only be added to L3 world_model nodes",
         )
 
-    # 读取现有 evidence
-    evidence_log_raw = meta.get("skill_evidence_log", "[]")
+    note_entry = {"at": datetime.now(timezone.utc).isoformat(), "note": req.note}
     try:
-        evidence_log = _json.loads(evidence_log_raw) if isinstance(evidence_log_raw, str) else evidence_log_raw
-    except (_json.JSONDecodeError, TypeError):
-        evidence_log = []
-
-    # 追加新 evidence
-    evidence_log.append({
-        "at": datetime.now(timezone.utc).isoformat(),
-        "note": req.note,
-    })
-
-    # 原子递增 skill_evidence_count 并合并写入 evidence_log
-    new_count = server_router.naive_mem_cube.text_mem.graph_store.increment_node_field(
-        req.world_model_id,
-        "skill_evidence_count",
-        increment=1,
-        extra_fields={"skill_evidence_log": _json.dumps(evidence_log, ensure_ascii=False)},
-        user_name=user.user_id,
-    )
+        new_count = server_router.naive_mem_cube.text_mem.graph_store.add_skill_evidence_atomic(
+            req.world_model_id, note_entry, user_name=user.user_id
+        )
+    except NotImplementedError:
+        raise HTTPException(status_code=501, detail="evidence_not_supported_backend")
     if new_count is None:
         raise HTTPException(status_code=404, detail="world_model_not_found")
 

@@ -162,16 +162,22 @@ class GraphStructureReorganizer:
             "[Reorganizer] _optimize_all_users scope=%s users=%s optimizing=%s",
             scope, users, dict(self._is_optimizing),
         )
+        all_mark_failures: list[str] = []
         for user_name in users:
             self.optimize_structure(scope=scope, user_name=user_name, **kwargs)
             # P2 L3：optimize_structure 产出新 L2 后立即消费归纳 world model。
             # _optimize_all_users 是 schedule 定时路径（每 100s）和 _reorganize_needed
             # 事件驱动路径（新节点触发）共同的调用入口，接在这里天然覆盖两条触发路径，
             # 无需在别处重复接线（four-layer-gap-assessment.md 3.2）。
-            self.induce_world_models(user_name=user_name)
+            all_mark_failures.extend(self.induce_world_models(user_name=user_name) or [])
             # P3 Skill：induce_world_models 产出新 L3 后立即消费归纳 Skill（evidence 驱动）。
             # 接在这里天然覆盖定时与事件驱动两条触发路径（four-layer-gap-assessment.md 3.3）。
-            self.induce_skills(user_name=user_name)
+            all_mark_failures.extend(self.induce_skills(user_name=user_name) or [])
+        if all_mark_failures:
+            logger.warning(
+                "[Reorganizer] %s nodes failed consumption marking this cycle (will retry next round): %s",
+                len(all_mark_failures), all_mark_failures[:10],
+            )
 
     def wait_until_current_task_done(self):
         """
@@ -794,7 +800,7 @@ class GraphStructureReorganizer:
             )
             return []
 
-    def induce_world_models(self, user_name: str | None = None) -> None:
+    def induce_world_models(self, user_name: str | None = None) -> list[str]:
         """P2 L3 二级归纳：消费该用户新产出且未被归纳过的 L2 policy，按语义聚类归纳
         跨场景稳定规律/用户画像（world model），对齐 memmy world-model-pipeline 语义
         （four-layer-gap-assessment.md 3.2）。
@@ -804,6 +810,8 @@ class GraphStructureReorganizer:
         到的 L2（不只是产出 L3 的那部分）在处理完后统一标记 world_induced=true**——
         不可归纳的 L2 不应无限重试拖慢调度，保持孤立即可，新证据积累后会随后续新
         产出的 L2 一起在下一批被重新拉取聚类。
+
+        返回标记失败的节点 id 列表。
         """
         policy_nodes = self._fetch_unconsumed_l2_policies(user_name=user_name)
         if not policy_nodes:
@@ -819,15 +827,14 @@ class GraphStructureReorganizer:
             user_name, len(policy_nodes),
         )
 
-        # 复用 _partition 做 embedding 语义聚类；max_cluster_size 调小以贴合 L3 场景
-        # （L2 批量上限 40，需要按主题切成更细的簇，而非像 L1->L2 那样整批粗聚）。
-        clusters = self._partition(policy_nodes, min_cluster_size=2, max_cluster_size=8)
-
         l3_count = 0
         skip_small_cluster = 0
         skip_no_world_or_low_gain = 0
         mark_failures: list[str] = []
         try:
+            # 复用 _partition 做 embedding 语义聚类；max_cluster_size 调小以贴合 L3 场景
+            # （L2 批量上限 40，需要按主题切成更细的簇，而非像 L1->L2 那样整批粗聚）。
+            clusters = self._partition(policy_nodes, min_cluster_size=2, max_cluster_size=8)
             for cluster_nodes in clusters:
                 if len(cluster_nodes) < self.MIN_WORLD_EVIDENCE:
                     skip_small_cluster += 1
@@ -867,6 +874,7 @@ class GraphStructureReorganizer:
             "skip_small_cluster=%s skip_no_world_model_or_low_gain=%s mark_failures=%s",
             user_name, len(policy_nodes), l3_count, skip_small_cluster, skip_no_world_or_low_gain, mark_failures,
         )
+        return mark_failures
 
     def _summarize_world_model(self, cluster_nodes: list[GraphDBNode]) -> GraphDBNode | None:
         """对同主题簇的多条 L2 policy 归纳 L3 world model（对齐 memmy world-model-pipeline
@@ -994,7 +1002,7 @@ class GraphStructureReorganizer:
             )
             return []
 
-    def induce_skills(self, user_name: str | None = None) -> None:
+    def induce_skills(self, user_name: str | None = None) -> list[str]:
         """P3 Skill 归纳：消费该用户 evidence 达标且未被归纳过的 L3 world model，
         按 evidence 验证提炼可执行技能（对齐 memmy skill-pipeline 的 evidence 驱动
         + trial 机制，four-layer-gap-assessment.md 3.3）。
@@ -1008,6 +1016,8 @@ class GraphStructureReorganizer:
         Skill 草稿态（trial）：产出的 Skill 节点 skill_status="trial"（草稿），
         memmy 语义是"需实际成功使用 N 次后转 activated"——本阶段先落 trial 态，
         后续接实际执行反馈后转正（由 Hermes 工具执行结果反馈或用户确认驱动）。
+
+        返回标记失败的节点 id 列表。
         """
         l3_nodes = self._fetch_evidence_qualified_l3(user_name=user_name)
         if not l3_nodes:
@@ -1050,6 +1060,7 @@ class GraphStructureReorganizer:
             "skip_no_skill_or_low_gain=%s mark_failures=%s",
             user_name, len(l3_nodes), skill_count, skip_no_skill_or_low_gain, mark_failures,
         )
+        return mark_failures
 
     def _summarize_skill(self, l3_node: GraphDBNode) -> GraphDBNode | None:
         """从 evidence 验证的 L3 world model 归纳可执行 Skill（对齐 memmy skill-pipeline
@@ -1068,12 +1079,31 @@ class GraphStructureReorganizer:
         world_value = l3_node.memory or ""
         world_summary = meta.background or ""
 
-        # 读取 evidence 日志
+        # 读取 evidence 日志（兼容两种格式）：
+        # 旧格式：整体 JSON 字符串 '["..",".."]' 或 '[{...},{...}]'
+        # 新格式：JSON 字符串列表（add_skill_evidence_atomic 的 DB 侧存储）
         evidence_log_raw = getattr(meta, "skill_evidence_log", "[]")
+        evidence_log: list = []
         try:
-            evidence_log = json.loads(evidence_log_raw) if isinstance(evidence_log_raw, str) else evidence_log_raw
+            if isinstance(evidence_log_raw, str):
+                parsed = json.loads(evidence_log_raw)
+                evidence_log = parsed if isinstance(parsed, list) else []
+            elif isinstance(evidence_log_raw, list):
+                evidence_log = evidence_log_raw
         except (json.JSONDecodeError, TypeError):
             evidence_log = []
+        normalized: list = []
+        for item in evidence_log:
+            if isinstance(item, dict):
+                normalized.append(item)
+            elif isinstance(item, str):
+                try:
+                    obj = json.loads(item)
+                    if isinstance(obj, dict):
+                        normalized.append(obj)
+                except json.JSONDecodeError:
+                    continue
+        evidence_log = normalized
 
         evidence_items_text = "\n".join(
             [f"{i+1}. [{item.get('at', '')}] {item.get('note', '')}" for i, item in enumerate(evidence_log)]
@@ -1111,6 +1141,14 @@ class GraphStructureReorganizer:
 
         skill_key = str(response_json.get("skill_key", "")).strip()
         skill_value = str(response_json.get("skill_value", "")).strip()
+
+        if not skill_key or not skill_value:
+            logger.warning(
+                "[Reorganizer] LLM returned empty skill_key/skill_value for L3 (id=%s), skip skill induction.",
+                l3_node.id,
+            )
+            return None
+
         skill_trigger = str(response_json.get("trigger", "")).strip()
         skill_tags = response_json.get("tags", [])
         if not isinstance(skill_tags, list):
