@@ -24,6 +24,7 @@ from memos.memories.textual.tree_text_memory.organize.relation_reason_detector i
 from memos.templates.tree_reorganize_prompts import (
     LOCAL_SUBCLUSTER_PROMPT,
     POLICY_INDUCTION_PROMPT,
+    WORLD_MODEL_PROMPT,
 )
 
 
@@ -90,6 +91,13 @@ class GraphStructureReorganizer:
     MIN_POLICY_EVIDENCE = 3
     MIN_POLICY_GAIN = 0.3
 
+    # P2 L3 world model 二级归纳门槛（four-layer-gap-assessment.md 3.2，对齐 memmy
+    # world-model-pipeline 语义）：
+    # - MIN_WORLD_EVIDENCE：归纳 world model 所需的最少同簇 L2 policy 数，低于此不调用 LLM
+    # - MIN_WORLD_GAIN：LLM 自评 gain_self_eval 门槛，低于此丢弃归纳结果（不生成 L3）
+    MIN_WORLD_EVIDENCE = 3
+    MIN_WORLD_GAIN = 0.3
+
     def __init__(
         self, graph_store: Neo4jGraphDB, llm: BaseLLM, embedder: OllamaEmbedder, is_reorganize: bool
     ):
@@ -148,6 +156,11 @@ class GraphStructureReorganizer:
         )
         for user_name in users:
             self.optimize_structure(scope=scope, user_name=user_name, **kwargs)
+            # P2 L3：optimize_structure 产出新 L2 后立即消费归纳 world model。
+            # _optimize_all_users 是 schedule 定时路径（每 100s）和 _reorganize_needed
+            # 事件驱动路径（新节点触发）共同的调用入口，接在这里天然覆盖两条触发路径，
+            # 无需在别处重复接线（four-layer-gap-assessment.md 3.2）。
+            self.induce_world_models(user_name=user_name)
 
     def wait_until_current_task_done(self):
         """
@@ -731,6 +744,179 @@ class GraphStructureReorganizer:
             ),
         )
         return parent_node
+
+    def _fetch_unconsumed_l2_policies(
+        self, user_name: str | None = None, limit: int = 40
+    ) -> list[GraphDBNode]:
+        """查询该用户尚未被 L3 归纳消费的 L2 policy（P2，four-layer-gap-assessment.md 3.2）。
+
+        消费标记：world_induced 布尔属性挂在 L2 节点上，默认未设置（NULL）视为未消费。
+        LIMIT 40：复用 P1 分批思路（optimize_structure 同款），防止一次性拉取过多节点 OOM。
+        """
+        where_clause = (
+            "WHERE n.type = 'policy' AND n.memory_layer = 'L2' AND n.status = 'activated' "
+            "AND (n.world_induced IS NULL OR n.world_induced = false)"
+        )
+        params: dict = {"limit": limit}
+        if user_name:
+            where_clause += " AND n.user_name = $user_name"
+            params["user_name"] = user_name
+
+        query = f"""
+            MATCH (n:Memory)
+            {where_clause}
+            RETURN n.id AS id, n AS node
+            ORDER BY n.created_at ASC
+            LIMIT $limit
+        """
+        try:
+            with self.graph_store.driver.session(database=self.graph_store.db_name) as session:
+                rows = session.run(query, params).data()
+            raw_nodes = [
+                self.graph_store._parse_node({"id": r["id"], **dict(r["node"])}) for r in rows
+            ]
+            return [GraphDBNode(**n) for n in raw_nodes]
+        except Exception:
+            logger.warning(
+                "[Reorganizer] fetch unconsumed L2 policies failed for user=%s", user_name,
+                exc_info=True,
+            )
+            return []
+
+    def induce_world_models(self, user_name: str | None = None) -> None:
+        """P2 L3 二级归纳：消费该用户新产出且未被归纳过的 L2 policy，按语义聚类归纳
+        跨场景稳定规律/用户画像（world model），对齐 memmy world-model-pipeline 语义
+        （four-layer-gap-assessment.md 3.2）。
+
+        L2 消费标记机制：world_induced 布尔属性默认未设置=未消费。无论簇内节点数是否
+        达到 MIN_WORLD_EVIDENCE、LLM 是否判定 no_world_model、gain 是否达标，**本批拉取
+        到的 L2（不只是产出 L3 的那部分）在处理完后统一标记 world_induced=true**——
+        不可归纳的 L2 不应无限重试拖慢调度，保持孤立即可，新证据积累后会随后续新
+        产出的 L2 一起在下一批被重新拉取聚类。
+        """
+        policy_nodes = self._fetch_unconsumed_l2_policies(user_name=user_name)
+        if not policy_nodes:
+            logger.warning(
+                "[Reorganizer] induce_world_models user=%s: no unconsumed L2 policies.",
+                user_name,
+            )
+            return
+
+        # WARNING 级：生产日志仅 WARNING 可见（log.py:33），关键数字必须在此可观察
+        logger.warning(
+            "[Reorganizer] induce_world_models user=%s input_policies=%s",
+            user_name, len(policy_nodes),
+        )
+
+        # 复用 _partition 做 embedding 语义聚类；max_cluster_size 调小以贴合 L3 场景
+        # （L2 批量上限 40，需要按主题切成更细的簇，而非像 L1->L2 那样整批粗聚）。
+        clusters = self._partition(policy_nodes, min_cluster_size=2, max_cluster_size=8)
+
+        l3_count = 0
+        skip_small_cluster = 0
+        skip_no_world_or_low_gain = 0
+        for cluster_nodes in clusters:
+            if len(cluster_nodes) < self.MIN_WORLD_EVIDENCE:
+                skip_small_cluster += 1
+                logger.warning(
+                    "[Reorganizer] world cluster size %s < MIN_WORLD_EVIDENCE=%s, "
+                    "skip LLM call (no L3 induction).",
+                    len(cluster_nodes), self.MIN_WORLD_EVIDENCE,
+                )
+                continue
+
+            world_node = self._summarize_world_model(cluster_nodes)
+            if world_node is None:
+                skip_no_world_or_low_gain += 1
+                continue
+
+            self._create_parent_node(world_node, user_name=user_name)
+            self._link_cluster_nodes(world_node, cluster_nodes, user_name=user_name)
+            l3_count += 1
+
+        for node in policy_nodes:
+            self.graph_store.update_node(node.id, {"world_induced": True}, user_name=user_name)
+
+        logger.warning(
+            "[Reorganizer] induce_world_models done user=%s input_policies=%s output_l3=%s "
+            "skip_small_cluster=%s skip_no_world_model_or_low_gain=%s",
+            user_name, len(policy_nodes), l3_count, skip_small_cluster, skip_no_world_or_low_gain,
+        )
+
+    def _summarize_world_model(self, cluster_nodes: list[GraphDBNode]) -> GraphDBNode | None:
+        """对同主题簇的多条 L2 policy 归纳 L3 world model（对齐 memmy world-model-pipeline
+        语义，four-layer-gap-assessment.md 3.2）。
+
+        质量门槛（未通过则返回 None，不生成 L3；调用方 induce_world_models 仍会把
+        这批 L2 标记为已消费，不因归纳失败而无限重试）：
+        - LLM 判定 no_world_model=true：这批 policy 彼此无共同主题，无法归纳出画像/规律
+        - gain_self_eval < MIN_WORLD_GAIN：画像/规律的置信度/收益不足
+        """
+        if not cluster_nodes:
+            raise ValueError("Cluster nodes cannot be empty.")
+
+        memories_items_text = "\n\n".join(
+            [
+                f"{i}. policy_key: {n.metadata.key}\npolicy_value: {n.memory}\n"
+                f"summary:{n.metadata.background}"
+                for i, n in enumerate(cluster_nodes)
+            ]
+        )
+
+        prompt = WORLD_MODEL_PROMPT.replace("{memory_items_text}", memories_items_text)
+
+        messages = [{"role": "user", "content": prompt}]
+        response_text = self.llm.generate(messages)
+        response_json = self._parse_json_result(response_text)
+
+        if not response_json or response_json.get("no_world_model"):
+            logger.warning(
+                "[Reorganizer] LLM reported no_world_model for cluster (size=%s): %s",
+                len(cluster_nodes),
+                response_json.get("reason", "") if response_json else "parse_failed",
+            )
+            return None
+
+        try:
+            gain_self_eval = float(response_json.get("gain_self_eval", 0.0))
+        except (TypeError, ValueError):
+            gain_self_eval = 0.0
+
+        if gain_self_eval < self.MIN_WORLD_GAIN:
+            logger.warning(
+                "[Reorganizer] gain_self_eval=%.3f < MIN_WORLD_GAIN=%s, skip L3 induction.",
+                gain_self_eval, self.MIN_WORLD_GAIN,
+            )
+            return None
+
+        world_key = str(response_json.get("world_key", "")).strip()
+        world_value = str(response_json.get("world_value", "")).strip()
+        world_tags = response_json.get("tags", [])
+        world_background = str(response_json.get("summary", "")).strip()
+
+        embedding = self.embedder.embed([world_value])[0]
+
+        world_node = GraphDBNode(
+            memory=world_value,
+            metadata=TreeNodeTextualMemoryMetadata(
+                user_id=None,
+                session_id=None,
+                memory_type=cluster_nodes[0].metadata.memory_type,
+                status="activated",
+                key=world_key,
+                tags=world_tags,
+                embedding=embedding,
+                usage=[],
+                # sources：来源 L2 policy 的 id 列表（复用 build_summary_parent_node，
+                # 与 _summarize_cluster 的 L1->L2 来源记录方式一致）
+                sources=build_summary_parent_node(cluster_nodes),
+                background=world_background,
+                confidence=gain_self_eval,
+                type="world_model",
+                memory_layer="L3",
+            ),
+        )
+        return world_node
 
     def _parse_json_result(self, response_text):
         try:

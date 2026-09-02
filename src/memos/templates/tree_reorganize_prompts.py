@@ -69,6 +69,38 @@ POLICY_INDUCTION_PROMPT = """你是一名行为规则归纳专家（policy induc
 {{"no_policy": true, "reason": <string，说明原因>}}
 """
 
+WORLD_MODEL_PROMPT = """你是一名用户画像/世界模型归纳专家（world model induction），负责从同一主题下的多条行为规则（L2 policy）中提炼跨场景仍然稳定的规律或用户画像，而不是复述某一条具体规则。
+
+以下是同一主题簇内的 L2 policy 条目（每条包含 policy_key/policy_value/summary）：
+
+{memory_items_text}
+
+任务要求：
+1. 只输出**跨场景仍然成立的稳定规律或用户画像**（world model），形如"用户是……类型的使用者"或"用户的工作流遵循……模式"——不要只是把某一条 policy 换个说法复述一遍。
+2. 该画像/规律必须能从至少两条独立的 policy 中共同归纳出来，代表这些 policy 背后共享的更高层特征，而不是其中一条的延伸或简单堆叠。
+3. 明确这个画像/规律适用的场景范围（哪些场景下用户表现出这个特征），以及支撑它的 policy 证据。
+4. 如实自评这条 world model 的置信度/收益（gain_self_eval，0.0-1.0）：
+   - 支撑证据（policy）越多、彼此越一致、画像越可执行 → 越接近 1.0
+   - 证据单薄、画像含糊、或更像是巧合而非稳定规律 → 越接近 0.0
+5. 如果这批 policy 彼此没有共同主题（各自独立、无法归纳出更高层的用户画像/规律），**不要勉强编造**，直接输出 {{"no_world_model": true, "reason": "<说明无法归纳的原因>"}}。
+
+语言规则：
+- 全部输出使用中文（输入是中文）。
+
+请返回合法 JSON（能归纳出 world model 时）：
+{{
+  "world_key": <string，画像/规律的简短名称，如"偏好日志优先的调试型使用者">,
+  "world_value": <string，跨场景稳定规律/用户画像本身，说明"用户是……类型的使用者"或"用户的工作流遵循……模式"，必须是跨场景仍然成立的稳定陈述，不得是单条 policy 复述>,
+  "evidence_count": <int，支持该 world model 的独立 policy 证据条数（本次输入中实际支持该画像的条目数，而非簇总条数）>,
+  "gain_self_eval": <float，0.0-1.0，对该 world model 可信度/收益的自评>,
+  "tags": <字符串数组，world model 相关的主题关键词>,
+  "summary": <string，支持该 world model 的 policy 证据概要，说明这些 policy 如何共同指向该画像/规律，而非逐条复述>
+}}
+
+无法归纳 world model 时，只返回：
+{{"no_world_model": true, "reason": <string，说明原因>}}
+"""
+
 DOC_REORGANIZE_PROMPT = """You are a document summarization and knowledge extraction expert.
 
 Given the following summarized document items:

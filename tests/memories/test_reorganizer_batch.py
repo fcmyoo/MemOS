@@ -207,3 +207,149 @@ class TestL2PolicyInduction:
         assert result is None
         assert llm.generate.called
         assert not embedder.embed.called
+
+
+class TestWorldModelInduction:
+    """测试 induce_world_models 的 P2 L3 二级归纳（four-layer-gap-assessment.md 3.2）"""
+
+    def _make_policy_node(self, node_id: str) -> GraphDBNode:
+        """构造 L2 policy 节点（memory_layer=L2, type=policy），供 world model 归纳消费"""
+        data = make_fake_node(node_id)
+        data["metadata"]["type"] = "policy"
+        data["metadata"]["memory_layer"] = "L2"
+        data["metadata"]["key"] = f"policy_key_{node_id}"
+        return GraphDBNode(**data)
+
+    def _make_policy_nodes(self, n: int) -> list[GraphDBNode]:
+        return [self._make_policy_node(f"policy_{i}") for i in range(n)]
+
+    def test_no_unconsumed_policies_skips_induction(self, mock_components):
+        """无未消费 L2 policy 时，直接返回，不调用 LLM，也不标记消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        with patch.object(reorganizer, "_fetch_unconsumed_l2_policies", return_value=[]):
+            reorganizer.induce_world_models(user_name="test_user")
+
+        assert not llm.generate.called
+        assert not graph_store.update_node.called
+
+    def test_below_min_world_evidence_skips_llm_but_marks_consumed(self, mock_components):
+        """簇内 L2 数 < MIN_WORLD_EVIDENCE(3) 时不调用 LLM，但该批 L2 仍标记 world_induced=True"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        policy_nodes = self._make_policy_nodes(2)
+
+        with (
+            patch.object(reorganizer, "_fetch_unconsumed_l2_policies", return_value=policy_nodes),
+            patch.object(reorganizer, "_partition", return_value=[policy_nodes]),
+        ):
+            reorganizer.induce_world_models(user_name="test_user")
+
+        assert not llm.generate.called
+        assert graph_store.update_node.call_count == len(policy_nodes)
+        updated_ids = {call.args[0] for call in graph_store.update_node.call_args_list}
+        assert updated_ids == {n.id for n in policy_nodes}
+        for call in graph_store.update_node.call_args_list:
+            assert call.args[1] == {"world_induced": True}
+
+    def test_no_world_model_response_skips_l3_but_marks_consumed(self, mock_components):
+        """LLM 判定 no_world_model=true 时不产生 L3，但该批 L2 仍标记消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        policy_nodes = self._make_policy_nodes(3)
+        llm.generate.return_value = (
+            '{"no_world_model": true, "reason": "这些 policy 彼此无共同主题"}'
+        )
+
+        with (
+            patch.object(reorganizer, "_fetch_unconsumed_l2_policies", return_value=policy_nodes),
+            patch.object(reorganizer, "_partition", return_value=[policy_nodes]),
+        ):
+            reorganizer.induce_world_models(user_name="test_user")
+
+        assert llm.generate.called
+        assert not graph_store.add_node.called
+        assert graph_store.update_node.call_count == len(policy_nodes)
+
+    def test_low_gain_skips_l3_but_marks_consumed(self, mock_components):
+        """gain_self_eval < MIN_WORLD_GAIN 时丢弃归纳结果，不产生 L3，但仍标记消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        policy_nodes = self._make_policy_nodes(3)
+        llm.generate.return_value = (
+            '{"world_key": "k", "world_value": "v", "summary": "s", "gain_self_eval": 0.1}'
+        )
+
+        with (
+            patch.object(reorganizer, "_fetch_unconsumed_l2_policies", return_value=policy_nodes),
+            patch.object(reorganizer, "_partition", return_value=[policy_nodes]),
+        ):
+            reorganizer.induce_world_models(user_name="test_user")
+
+        assert llm.generate.called
+        assert not graph_store.add_node.called
+        assert graph_store.update_node.call_count == len(policy_nodes)
+
+    def test_successful_induction_creates_l3_and_links(self, mock_components):
+        """gain 达标且判定有 world model 时，创建 L3 父节点并挂 PARENT 边，同时标记消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        policy_nodes = self._make_policy_nodes(3)
+        llm.generate.return_value = (
+            '{"world_key": "prefers_terse_reviews", '
+            '"world_value": "用户偏好简洁的代码评审反馈", '
+            '"summary": "多次反馈都指向同一偏好", '
+            '"tags": ["review"], "gain_self_eval": 0.8}'
+        )
+        embedder.embed.return_value = [[0.2] * 128]
+        graph_store.edge_exists.return_value = False
+
+        with (
+            patch.object(reorganizer, "_fetch_unconsumed_l2_policies", return_value=policy_nodes),
+            patch.object(reorganizer, "_partition", return_value=[policy_nodes]),
+        ):
+            reorganizer.induce_world_models(user_name="test_user")
+
+        assert graph_store.add_node.called
+        added_metadata = graph_store.add_node.call_args[0][2]
+        assert added_metadata["memory_layer"] == "L3"
+        assert added_metadata["type"] == "world_model"
+        assert graph_store.add_edge.call_count == len(policy_nodes)
+        assert graph_store.update_node.call_count == len(policy_nodes)
+
+    def test_mixed_clusters_all_input_policies_marked_consumed(self, mock_components):
+        """多簇混合结果（部分产出 L3、部分被跳过）时，本批拉取到的全部 L2 仍统一标记消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        cluster_ok = self._make_policy_nodes(3)
+        cluster_small = [self._make_policy_node("policy_small_0")]
+        all_policy_nodes = cluster_ok + cluster_small
+
+        llm.generate.return_value = (
+            '{"world_key": "k", "world_value": "v", "summary": "s", '
+            '"tags": [], "gain_self_eval": 0.9}'
+        )
+        embedder.embed.return_value = [[0.3] * 128]
+        graph_store.edge_exists.return_value = False
+
+        with (
+            patch.object(
+                reorganizer, "_fetch_unconsumed_l2_policies", return_value=all_policy_nodes
+            ),
+            patch.object(reorganizer, "_partition", return_value=[cluster_ok, cluster_small]),
+        ):
+            reorganizer.induce_world_models(user_name="test_user")
+
+        # cluster_small 只有 1 个节点 < MIN_WORLD_EVIDENCE，不产出 L3，
+        # 但 update_node 仍覆盖全部输入的 4 个节点（不因归纳失败而无限重试）
+        assert graph_store.add_node.call_count == 1
+        assert graph_store.add_edge.call_count == len(cluster_ok)
+        assert graph_store.update_node.call_count == len(all_policy_nodes)
+        updated_ids = {call.args[0] for call in graph_store.update_node.call_args_list}
+        assert updated_ids == {n.id for n in all_policy_nodes}
