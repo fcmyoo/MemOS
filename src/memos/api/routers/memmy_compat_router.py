@@ -295,7 +295,6 @@ def skill_evidence_add(
         )
 
     # 读取现有 evidence
-    evidence_count = meta.get("skill_evidence_count", 0)
     evidence_log_raw = meta.get("skill_evidence_log", "[]")
     try:
         evidence_log = _json.loads(evidence_log_raw) if isinstance(evidence_log_raw, str) else evidence_log_raw
@@ -303,22 +302,23 @@ def skill_evidence_add(
         evidence_log = []
 
     # 追加新 evidence
-    evidence_count += 1
     evidence_log.append({
         "at": datetime.now(timezone.utc).isoformat(),
         "note": req.note,
     })
 
-    # 更新节点
-    update_data = {
-        "skill_evidence_count": evidence_count,
-        "skill_evidence_log": _json.dumps(evidence_log, ensure_ascii=False),
-    }
-    server_router.naive_mem_cube.text_mem.graph_store.update_node(
-        req.world_model_id, update_data, user_name=user.user_id
+    # 原子递增 skill_evidence_count 并合并写入 evidence_log
+    new_count = server_router.naive_mem_cube.text_mem.graph_store.increment_node_field(
+        req.world_model_id,
+        "skill_evidence_count",
+        increment=1,
+        extra_fields={"skill_evidence_log": _json.dumps(evidence_log, ensure_ascii=False)},
+        user_name=user.user_id,
     )
+    if new_count is None:
+        raise HTTPException(status_code=404, detail="world_model_not_found")
 
     return {
         "world_model_id": req.world_model_id,
-        "skill_evidence_count": evidence_count,
+        "skill_evidence_count": new_count,
     }

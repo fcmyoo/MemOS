@@ -457,3 +457,110 @@ class TestSkillInduction:
         call = graph_store.update_node.call_args_list[0]
         assert call.args[0] == world_node.id
         assert call.args[1] == {"skill_induced": True}
+
+
+class TestInductionResilience:
+    """测试归纳流程异常隔离和消费标记容错（Codex 复审 P1/P2 修复验证）。"""
+
+    def _make_policy_node(self, node_id: str) -> GraphDBNode:
+        """构造 L2 policy 节点"""
+        data = make_fake_node(node_id)
+        data["metadata"]["type"] = "policy"
+        data["metadata"]["memory_layer"] = "L2"
+        data["metadata"]["key"] = f"policy_key_{node_id}"
+        return GraphDBNode(**data)
+
+    def _make_world_node(self, node_id: str, skill_evidence_count: int = 5) -> GraphDBNode:
+        """构造 L3 world model 节点"""
+        data = make_fake_node(node_id)
+        data["metadata"]["type"] = "world_model"
+        data["metadata"]["memory_layer"] = "L3"
+        data["metadata"]["key"] = f"world_key_{node_id}"
+        data["metadata"]["skill_evidence_count"] = skill_evidence_count
+        data["metadata"]["skill_evidence_log"] = '[{"at": "2024-01-01", "note": "test"}]'
+        return GraphDBNode(**data)
+
+    def test_world_induction_exception_marks_consumed(self, mock_components):
+        """_summarize_world_model 抛异常 → 不产出 L3、该批节点全部被标记 world_induced=True。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        policy_nodes = [self._make_policy_node(f"policy_{i}") for i in range(2)]
+
+        with (
+            patch.object(reorganizer, "_fetch_unconsumed_l2_policies", return_value=policy_nodes),
+            patch.object(reorganizer, "_partition", return_value=[policy_nodes]),
+            patch.object(reorganizer, "_summarize_world_model", side_effect=RuntimeError("LLM timeout")),
+        ):
+            reorganizer.induce_world_models(user_name="test_user")
+
+        # 验证：add_node 未调用（无 L3 产出）
+        assert not graph_store.add_node.called
+
+        # 验证：所有节点被标记 world_induced=True
+        assert graph_store.update_node.call_count == len(policy_nodes)
+        for node in policy_nodes:
+            graph_store.update_node.assert_any_call(
+                node.id, {"world_induced": True}, user_name="test_user"
+            )
+
+    def test_skill_induction_exception_marks_consumed(self, mock_components):
+        """_summarize_skill 抛异常 → L3 被标记 skill_induced=True。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        l3_node = self._make_world_node("world_0")
+
+        with (
+            patch.object(reorganizer, "_fetch_evidence_qualified_l3", return_value=[l3_node]),
+            patch.object(reorganizer, "_summarize_skill", side_effect=RuntimeError("Embedding service down")),
+        ):
+            reorganizer.induce_skills(user_name="test_user")
+
+        # 验证：add_node 未调用（无 Skill 产出）
+        assert not graph_store.add_node.called
+
+        # 验证：L3 节点被标记 skill_induced=True
+        graph_store.update_node.assert_called_once_with(
+            l3_node.id, {"skill_induced": True}, user_name="test_user"
+        )
+
+    def test_malformed_llm_response_returns_empty_dict(self, mock_components):
+        """_parse_json_result 接收畸形输入 → 全部返回 {} 不抛异常。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        test_cases = [
+            None,                    # 非字符串：None
+            123,                     # 非字符串：int
+            "not json",              # 非 JSON
+            "[1,2,3]",              # 非 dict JSON（list）
+        ]
+
+        for input_val in test_cases:
+            result = reorganizer._parse_json_result(input_val)
+            assert result == {}, f"Expected {{}} for input {input_val!r}, got {result}"
+
+    def test_evidence_count_malformed_falls_back(self, mock_components):
+        """_summarize_skill 返回的 evidence_count 畸形 → 不抛异常，回落 len(evidence_log)。"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        l3_node = self._make_world_node("world_0")
+        evidence_log = [{"at": "2024-01-01", "note": "e1"}, {"at": "2024-01-02", "note": "e2"}]
+        l3_node.metadata.skill_evidence_log = evidence_log
+
+        # Mock LLM 返回 evidence_count 为非数值字符串
+        llm.generate.return_value = (
+            '{"skill_key": "test_key", "skill_value": "test_value", '
+            '"evidence_count": "two", "gain_self_eval": 0.8, '
+            '"summary": "test", "trigger": "test"}'
+        )
+        embedder.embed.return_value = [[0.1] * 128]
+
+        skill_node = reorganizer._summarize_skill(l3_node)
+
+        # 验证：evidence_count 回落为 len(evidence_log)=2
+        assert skill_node is not None
+        assert skill_node.metadata.skill_evidence_count == len(evidence_log)
+

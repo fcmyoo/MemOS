@@ -826,32 +826,46 @@ class GraphStructureReorganizer:
         l3_count = 0
         skip_small_cluster = 0
         skip_no_world_or_low_gain = 0
-        for cluster_nodes in clusters:
-            if len(cluster_nodes) < self.MIN_WORLD_EVIDENCE:
-                skip_small_cluster += 1
-                logger.warning(
-                    "[Reorganizer] world cluster size %s < MIN_WORLD_EVIDENCE=%s, "
-                    "skip LLM call (no L3 induction).",
-                    len(cluster_nodes), self.MIN_WORLD_EVIDENCE,
-                )
-                continue
+        mark_failures: list[str] = []
+        try:
+            for cluster_nodes in clusters:
+                if len(cluster_nodes) < self.MIN_WORLD_EVIDENCE:
+                    skip_small_cluster += 1
+                    logger.warning(
+                        "[Reorganizer] world cluster size %s < MIN_WORLD_EVIDENCE=%s, "
+                        "skip LLM call (no L3 induction).",
+                        len(cluster_nodes), self.MIN_WORLD_EVIDENCE,
+                    )
+                    continue
 
-            world_node = self._summarize_world_model(cluster_nodes)
-            if world_node is None:
-                skip_no_world_or_low_gain += 1
-                continue
-
-            self._create_parent_node(world_node, user_name=user_name)
-            self._link_cluster_nodes(world_node, cluster_nodes, user_name=user_name)
-            l3_count += 1
-
-        for node in policy_nodes:
-            self.graph_store.update_node(node.id, {"world_induced": True}, user_name=user_name)
+                try:
+                    world_node = self._summarize_world_model(cluster_nodes)
+                    if world_node is None:
+                        skip_no_world_or_low_gain += 1
+                    else:
+                        self._create_parent_node(world_node, user_name=user_name)
+                        self._link_cluster_nodes(world_node, cluster_nodes, user_name=user_name)
+                        l3_count += 1
+                except Exception:
+                    # 单簇异常隔离：LLM/embedding/写入失败只跳过本簇，不中止整批
+                    logger.exception(
+                        "[Reorganizer] world induction failed for cluster of %s nodes, skip.",
+                        len(cluster_nodes),
+                    )
+        finally:
+            # best-effort 消费标记：无论成功/no_world_model/低 gain/异常/未入簇，
+            # 本批拉取到的所有 L2 最终都尝试置位，防无限重试（docstring 语义）
+            for node in policy_nodes:
+                try:
+                    self.graph_store.update_node(node.id, {"world_induced": True}, user_name=user_name)
+                except Exception:
+                    mark_failures.append(node.id)
+                    logger.exception("[Reorganizer] failed to mark world_induced for node %s", node.id)
 
         logger.warning(
             "[Reorganizer] induce_world_models done user=%s input_policies=%s output_l3=%s "
-            "skip_small_cluster=%s skip_no_world_model_or_low_gain=%s",
-            user_name, len(policy_nodes), l3_count, skip_small_cluster, skip_no_world_or_low_gain,
+            "skip_small_cluster=%s skip_no_world_model_or_low_gain=%s mark_failures=%s",
+            user_name, len(policy_nodes), l3_count, skip_small_cluster, skip_no_world_or_low_gain, mark_failures,
         )
 
     def _summarize_world_model(self, cluster_nodes: list[GraphDBNode]) -> GraphDBNode | None:
@@ -903,7 +917,16 @@ class GraphStructureReorganizer:
         world_key = str(response_json.get("world_key", "")).strip()
         world_value = str(response_json.get("world_value", "")).strip()
         world_tags = response_json.get("tags", [])
+        if not isinstance(world_tags, list):
+            world_tags = []
+        world_tags = [str(t) for t in world_tags]
         world_background = str(response_json.get("summary", "")).strip()
+
+        if not world_key or not world_value:
+            logger.warning(
+                "[Reorganizer] world_key or world_value is empty after parsing, skip L3 induction.",
+            )
+            return None
 
         embedding = self.embedder.embed([world_value])[0]
 
@@ -1002,25 +1025,30 @@ class GraphStructureReorganizer:
 
         skill_count = 0
         skip_no_skill_or_low_gain = 0
+        mark_failures: list[str] = []
         for l3_node in l3_nodes:
-            skill_node = self._summarize_skill(l3_node)
-            if skill_node is None:
-                skip_no_skill_or_low_gain += 1
-                continue
-
-            self._create_parent_node(skill_node, user_name=user_name)
-            # Link: Skill → L3（sources 记录，PARENT 边表示层级关系）
-            self._link_cluster_nodes(skill_node, [l3_node], user_name=user_name)
-            skill_count += 1
-
-        # 标记本批 L3 已消费（无论是否产出 Skill）
-        for node in l3_nodes:
-            self.graph_store.update_node(node.id, {"skill_induced": True}, user_name=user_name)
+            try:
+                skill_node = self._summarize_skill(l3_node)
+                if skill_node is None:
+                    skip_no_skill_or_low_gain += 1
+                else:
+                    self._create_parent_node(skill_node, user_name=user_name)
+                    # Link: Skill → L3（sources 记录，PARENT 边表示层级关系）
+                    self._link_cluster_nodes(skill_node, [l3_node], user_name=user_name)
+                    skill_count += 1
+            except Exception:
+                logger.exception("[Reorganizer] skill induction failed for L3 %s, skip.", l3_node.id)
+            finally:
+                try:
+                    self.graph_store.update_node(l3_node.id, {"skill_induced": True}, user_name=user_name)
+                except Exception:
+                    mark_failures.append(l3_node.id)
+                    logger.exception("[Reorganizer] failed to mark skill_induced for node %s", l3_node.id)
 
         logger.warning(
             "[Reorganizer] induce_skills done user=%s input_l3=%s output_skill=%s "
-            "skip_no_skill_or_low_gain=%s",
-            user_name, len(l3_nodes), skill_count, skip_no_skill_or_low_gain,
+            "skip_no_skill_or_low_gain=%s mark_failures=%s",
+            user_name, len(l3_nodes), skill_count, skip_no_skill_or_low_gain, mark_failures,
         )
 
     def _summarize_skill(self, l3_node: GraphDBNode) -> GraphDBNode | None:
@@ -1085,8 +1113,15 @@ class GraphStructureReorganizer:
         skill_value = str(response_json.get("skill_value", "")).strip()
         skill_trigger = str(response_json.get("trigger", "")).strip()
         skill_tags = response_json.get("tags", [])
+        if not isinstance(skill_tags, list):
+            skill_tags = []
+        skill_tags = [str(t) for t in skill_tags]
         skill_summary = str(response_json.get("summary", "")).strip()
-        evidence_count = int(response_json.get("evidence_count", len(evidence_log)))
+        raw_evidence_count = response_json.get("evidence_count", len(evidence_log))
+        try:
+            evidence_count = int(raw_evidence_count)
+        except (TypeError, ValueError):
+            evidence_count = len(evidence_log)
 
         embedding = self.embedder.embed([skill_value])[0]
 
@@ -1118,14 +1153,19 @@ class GraphStructureReorganizer:
         return skill_node
 
     def _parse_json_result(self, response_text):
+        """解析 LLM JSON 输出；任何畸形输入（None/非字符串/非 JSON/非 dict）都返回 {}，绝不抛异常。"""
+        if not isinstance(response_text, str):
+            logger.warning("[Reorganizer] LLM response is not a string: %r, treat as parse failure.", type(response_text).__name__)
+            return {}
         try:
-            response_text = response_text.replace("```", "").replace("json", "")
-            response_json = extract_first_to_last_brace(response_text)[1]
-            return response_json
-        except json.JSONDecodeError as e:
-            logger.warning(
-                f"Failed to parse LLM response as JSON: {e}\nRaw response:\n{response_text}"
-            )
+            cleaned = response_text.replace("```", "").replace("json", "")
+            result = extract_first_to_last_brace(cleaned)[1]
+            if not isinstance(result, dict):
+                logger.warning("[Reorganizer] LLM response parsed to non-dict: %s, treat as parse failure.", type(result).__name__)
+                return {}
+            return result
+        except Exception as e:  # JSONDecodeError 及 extract 失败等一律兜底
+            logger.warning("Failed to parse LLM response as JSON: %s\nRaw response:\n%s", e, response_text)
             return {}
 
     def _create_parent_node(self, parent_node: GraphDBNode, user_name: str | None = None) -> None:
