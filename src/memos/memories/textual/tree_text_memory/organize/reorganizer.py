@@ -21,7 +21,10 @@ from memos.memories.textual.tree_text_memory.organize.handler import NodeHandler
 from memos.memories.textual.tree_text_memory.organize.relation_reason_detector import (
     RelationAndReasoningDetector,
 )
-from memos.templates.tree_reorganize_prompts import LOCAL_SUBCLUSTER_PROMPT, REORGANIZE_PROMPT
+from memos.templates.tree_reorganize_prompts import (
+    LOCAL_SUBCLUSTER_PROMPT,
+    POLICY_INDUCTION_PROMPT,
+)
 
 
 logger = get_logger(__name__)
@@ -79,6 +82,14 @@ def extract_first_to_last_brace(text: str):
 
 
 class GraphStructureReorganizer:
+    # P1 L2 质化门槛（four-layer-gap-assessment.md 3.1，对齐 memmy policy-induction 语义）：
+    # - SEMANTIC_THRESHOLD：簇内节点与锚点的余弦相似度门槛，剔除"时间相邻但语义无关"的节点
+    # - MIN_POLICY_EVIDENCE：归纳 policy 所需的最少有效证据（节点）数，低于此不调用 LLM
+    # - MIN_POLICY_GAIN：LLM 自评 gain_self_eval 门槛，低于此丢弃归纳结果（不生成 L2）
+    SEMANTIC_THRESHOLD = 0.75
+    MIN_POLICY_EVIDENCE = 3
+    MIN_POLICY_GAIN = 0.3
+
     def __init__(
         self, graph_store: Neo4jGraphDB, llm: BaseLLM, embedder: OllamaEmbedder, is_reorganize: bool
     ):
@@ -364,25 +375,40 @@ class GraphStructureReorganizer:
         if len(cluster_nodes) <= min_cluster_size:
             return
 
-        # Large cluster ➜ local sub-clustering
-        sub_clusters = self._local_subcluster(cluster_nodes)
-        sub_parents = []
+        # P1 L2 质化：语义相似度过滤 —— 时间相邻 ≠ 语义相近，先剔除与簇内锚点偏离的节点，
+        # 避免"发消息+模型配置+脚本修改"这类混杂摘要（four-layer-gap-assessment.md 3.1）。
+        # 仅用于 L2 归纳路径；下方 relation/reasoning 检测仍对原始 cluster_nodes 生效。
+        semantic_nodes = self._semantic_filter(cluster_nodes)
+        if len(semantic_nodes) < min_cluster_size:
+            logger.info(
+                "[Reorganizer] semantic filter kept %s/%s nodes (< min_cluster_size=%s), "
+                "skip L2 induction this round (nodes stay isolated to accumulate).",
+                len(semantic_nodes), len(cluster_nodes), min_cluster_size,
+            )
+        else:
+            # Large cluster ➜ local sub-clustering（对语义过滤后的节点做 policy 归纳）
+            sub_clusters = self._local_subcluster(semantic_nodes)
+            sub_parents = []
 
-        for sub_nodes in sub_clusters:
-            if len(sub_nodes) < min_cluster_size:
-                continue  # Skip tiny noise
-            sub_parent_node = self._summarize_cluster(sub_nodes, scope)
-            self._create_parent_node(sub_parent_node, user_name=user_name)
-            self._link_cluster_nodes(sub_parent_node, sub_nodes, user_name=user_name)
-            sub_parents.append(sub_parent_node)
+            for sub_nodes in sub_clusters:
+                if len(sub_nodes) < min_cluster_size:
+                    continue  # Skip tiny noise
+                sub_parent_node = self._summarize_cluster(sub_nodes, scope)
+                if sub_parent_node is None:
+                    # gain 门槛未通过或 LLM 判定 no_policy：不生成 L2，节点保持孤立待积累
+                    continue
+                self._create_parent_node(sub_parent_node, user_name=user_name)
+                self._link_cluster_nodes(sub_parent_node, sub_nodes, user_name=user_name)
+                sub_parents.append(sub_parent_node)
 
-        if sub_parents and len(sub_parents) >= min_cluster_size:
-            cluster_parent_node = self._summarize_cluster(cluster_nodes, scope)
-            self._create_parent_node(cluster_parent_node, user_name=user_name)
-            for sub_parent in sub_parents:
-                self.graph_store.add_edge(
-                    cluster_parent_node.id, sub_parent.id, "PARENT", user_name=user_name
-                )
+            if sub_parents and len(sub_parents) >= min_cluster_size:
+                cluster_parent_node = self._summarize_cluster(semantic_nodes, scope)
+                if cluster_parent_node is not None:
+                    self._create_parent_node(cluster_parent_node, user_name=user_name)
+                    for sub_parent in sub_parents:
+                        self.graph_store.add_edge(
+                            cluster_parent_node.id, sub_parent.id, "PARENT", user_name=user_name
+                        )
 
         logger.info("Adding relations/reasons")
         nodes_to_check = cluster_nodes
@@ -589,12 +615,56 @@ class GraphStructureReorganizer:
 
         return filtered_clusters
 
-    def _summarize_cluster(self, cluster_nodes: list[GraphDBNode], scope: str) -> GraphDBNode:
+    def _semantic_filter(self, cluster_nodes: list[GraphDBNode]) -> list[GraphDBNode]:
+        """按语义相似度过滤簇内节点（P1 L2 质化，four-layer-gap-assessment.md 3.1）。
+
+        取簇内第一个具备 embedding 的节点为锚点，剔除与锚点余弦相似度 < SEMANTIC_THRESHOLD 的节点，
+        解决"时间相邻但语义无关"混进同一摘要的问题（如"发消息+模型配置+脚本修改"）。
+        无 embedding 的节点无法评估相似度，原样保留（存量数据兼容，不因缺失 embedding 被误伤）；
+        簇内全员都没有 embedding（无锚点可选）时不过滤，返回原簇。
         """
-        Generate a cluster label using LLM, based on top keys in the cluster.
+        anchor = next((n for n in cluster_nodes if n.metadata.embedding), None)
+        if anchor is None:
+            return cluster_nodes
+
+        anchor_vec = np.array(anchor.metadata.embedding, dtype=float)
+        anchor_norm = np.linalg.norm(anchor_vec)
+        if anchor_norm == 0:
+            return cluster_nodes
+
+        kept = []
+        for n in cluster_nodes:
+            if not n.metadata.embedding:
+                kept.append(n)
+                continue
+            vec = np.array(n.metadata.embedding, dtype=float)
+            vec_norm = np.linalg.norm(vec)
+            sim = float(np.dot(anchor_vec, vec) / (anchor_norm * vec_norm)) if vec_norm else 0.0
+            if sim >= self.SEMANTIC_THRESHOLD:
+                kept.append(n)
+        return kept
+
+    def _summarize_cluster(
+        self, cluster_nodes: list[GraphDBNode], scope: str
+    ) -> GraphDBNode | None:
+        """
+        对同主题簇归纳 L2 policy（对齐 memmy policy-induction 语义，four-layer-gap-assessment.md 3.1）。
+
+        质量门槛（未通过则返回 None，不生成 L2，节点保持孤立待积累）：
+        - 有效节点数 < MIN_POLICY_EVIDENCE：证据太少，不调用 LLM
+        - LLM 判定 no_policy=true：这批记忆无法归纳出可复用规则
+        - gain_self_eval < MIN_POLICY_GAIN：规则可信度/收益不足
         """
         if not cluster_nodes:
             raise ValueError("Cluster nodes cannot be empty.")
+
+        if len(cluster_nodes) < self.MIN_POLICY_EVIDENCE:
+            logger.info(
+                "[Reorganizer] cluster size %s < MIN_POLICY_EVIDENCE=%s, skip L2 induction "
+                "(no LLM call).",
+                len(cluster_nodes), self.MIN_POLICY_EVIDENCE,
+            )
+            return None
 
         memories_items_text = "\n\n".join(
             [
@@ -604,17 +674,37 @@ class GraphStructureReorganizer:
         )
 
         # Build prompt
-        prompt = REORGANIZE_PROMPT.replace("{memory_items_text}", memories_items_text)
+        prompt = POLICY_INDUCTION_PROMPT.replace("{memory_items_text}", memories_items_text)
 
         messages = [{"role": "user", "content": prompt}]
         response_text = self.llm.generate(messages)
         response_json = self._parse_json_result(response_text)
 
-        # Extract fields
-        parent_key = response_json.get("key", "").strip()
-        parent_value = response_json.get("value", "").strip()
+        if not response_json or response_json.get("no_policy"):
+            logger.info(
+                "[Reorganizer] LLM reported no_policy for cluster (size=%s): %s",
+                len(cluster_nodes),
+                response_json.get("reason", "") if response_json else "parse_failed",
+            )
+            return None
+
+        try:
+            gain_self_eval = float(response_json.get("gain_self_eval", 0.0))
+        except (TypeError, ValueError):
+            gain_self_eval = 0.0
+
+        if gain_self_eval < self.MIN_POLICY_GAIN:
+            logger.info(
+                "[Reorganizer] gain_self_eval=%.3f < MIN_POLICY_GAIN=%s, skip L2 induction.",
+                gain_self_eval, self.MIN_POLICY_GAIN,
+            )
+            return None
+
+        # Extract fields（policy-induction schema：policy_key/policy_value，而非旧 key/value）
+        parent_key = str(response_json.get("policy_key", "")).strip()
+        parent_value = str(response_json.get("policy_value", "")).strip()
         parent_tags = response_json.get("tags", [])
-        parent_background = response_json.get("summary", "").strip()
+        parent_background = str(response_json.get("summary", "")).strip()
 
         embedding = self.embedder.embed([parent_value])[0]
 
@@ -631,9 +721,10 @@ class GraphStructureReorganizer:
                 usage=[],
                 sources=build_summary_parent_node(cluster_nodes),
                 background=parent_background,
-                confidence=0.66,
-                type="topic",
-                # 方案 2：聚类摘要父节点 = L2 归纳层（policy/主题归纳）。
+                confidence=gain_self_eval,
+                type="policy",
+                # P1 L2 质化：type 由 "topic"（内容摘要）改为 "policy"（行为规则归纳），
+                # confidence 由固定 0.66 改为 LLM 自评 gain_self_eval。
                 # TextualMemoryMetadata extra="allow"，字段会持久化到 Neo4j 顶层属性，
                 # 与 memmy 同步记忆的 memory_layer 口径一致，前端按层筛选即可命中。
                 memory_layer="L2",

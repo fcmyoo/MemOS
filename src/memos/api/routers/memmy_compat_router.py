@@ -17,12 +17,16 @@ from memos.api.middleware.auth import AuthContext, get_current_user
 
 router = APIRouter(prefix="/api/v1", tags=["memmy-compat"])
 
-# layer → memory_type 映射（与一期 sync 脚本 LAYER_MAP 对齐）
+# layer → memory_type 语义映射（P1 层映射语义收口，four-layer-gap-assessment.md 3.4）。
+# 层由内容性质决定，而非由 API 调用方指定：
+#   - L1（原始 trace）：由本 API 写入，唯一对外开放的层
+#   - L2（policy 归纳）/L3（world model）：由 reorganizer 等内部管线语义聚类产出
+#   - Skill（可执行技能）：由 skill evidence/trial 管线产出
+# 因此本 API 只接受 L1，L2/L3/Skill 一律 422（见 memory_add 校验）。
+# 注意：fast 直存路径下 SingleCubeView 实际按“消息角色”而非本映射决定 memory_type
+# （single_struct.py:374-389），这里的 L1→UserMemory 仅作语义留档，不参与运行时覆盖。
 _LAYER_TO_TYPE = {
     "L1": "UserMemory",
-    "L2": "LongTermMemory",
-    "L3": "LongTermMemory",
-    "Skill": "SkillMemory",
 }
 
 
@@ -30,7 +34,12 @@ class MemoryAddRequest(BaseModel):
     content: str = Field(..., description="记忆内容")
     title: Optional[str] = None
     tags: Optional[list[str]] = None
-    layer: Optional[str] = Field(default="L1", description="L1/L2/L3/Skill")
+    layer: Optional[str] = Field(
+        default="L1",
+        description="仅支持 L1（原始 trace，由插件/用户写入）。"
+        "L2/L3/Skill 由 MemOS 内部管线（reorganizer/world-model/skill pipeline）产出，"
+        "本 API 不接受这些层的写入请求。",
+    )
     source: Optional[str] = "hermes"
     sessionId: Optional[str] = None
 
@@ -45,9 +54,17 @@ def memory_add(
     req: MemoryAddRequest,
     current_user: AuthContext = Depends(get_current_user),
 ) -> dict:
-    """写入一条记忆（fast 直存，层映射 memory_type）。API key 鉴权（身份=key 绑定的用户）。"""
+    """写入一条记忆（fast 直存，仅接受 L1）。API key 鉴权（身份=key 绑定的用户）。
+
+    P1 层映射语义收口（four-layer-gap-assessment.md 3.4）：L2/L3/Skill 是内部管线
+    （reorganizer 语义聚类 / world-model 二级聚类 / skill evidence-trial）的产物，
+    不通过对外 API 写入，一律 422 拒绝。
+    """
     if req.layer not in _LAYER_TO_TYPE:
-        raise HTTPException(status_code=422, detail=f"invalid_layer: {req.layer}")
+        raise HTTPException(
+            status_code=422,
+            detail="layer_not_allowed_for_api: L2/L3/Skill are produced by internal pipelines",
+        )
     # 复用 /product/add 的 add_handler 走 fast 写入（实例在 server_router 模块级）
     from memos.api.routers import server_router
 

@@ -37,6 +37,38 @@ Return valid JSON:
 
 """
 
+POLICY_INDUCTION_PROMPT = """你是一名行为规则归纳专家（policy induction），负责从同一主题的多条记忆事件（episode）中提炼可复用的行为规则，而不是复述这些事件发生了什么。
+
+以下是同一主题簇内的记忆条目（每条包含 key/value/summary）：
+
+{memory_items_text}
+
+任务要求：
+1. 只输出**可复用的条件化行为规则**（policy），形如"在场景 X 下，采取行为 A 优于/应当 B"——不要只是把输入事件换个说法复述一遍。
+2. 规则必须能从至少两条独立证据中归纳出来，具备跨事件的稳定性，而非单次偶然行为。
+3. 明确规则生效的场景/条件（时间、任务类型、触发条件等），以及该场景下应采取的行动，和为何这个行动更优（对比、结果、教训）。
+4. 如实自评这条规则的置信度/收益（gain_self_eval，0.0-1.0）：
+   - 证据越多、越一致、规则越可执行 → 越接近 1.0
+   - 证据单薄、规则含糊、更像是巧合或一次性偏好 → 越接近 0.0
+5. 如果这批记忆无法归纳出任何可复用的行为规则（例如内容彼此无关、只是时间相邻、或都是一次性事件），**不要勉强编造规则**，直接输出 {{"no_policy": true, "reason": "<说明无法归纳的原因>"}}。
+
+语言规则：
+- 全部输出使用中文（输入是中文）。
+
+请返回合法 JSON（能归纳出规则时）：
+{{
+  "policy_key": <string，规则的简短名称，如"调试卡住时优先查日志而非猜测">,
+  "policy_value": <string，条件化行为规则本身，说明"在场景 X 下，采取 A 优于 B"，必须是可执行的规则陈述，不得是事件复述>,
+  "evidence_count": <int，支持该规则的独立证据条数（本次输入中实际支持规则的条目数，而非簇总条数）>,
+  "gain_self_eval": <float，0.0-1.0，对该规则可信度/收益的自评>,
+  "tags": <字符串数组，规则相关的主题关键词>,
+  "summary": <string，支持该规则的证据概要，说明这些证据如何共同指向该规则，而非逐条复述事件>
+}}
+
+无法归纳规则时，只返回：
+{{"no_policy": true, "reason": <string，说明原因>}}
+"""
+
 DOC_REORGANIZE_PROMPT = """You are a document summarization and knowledge extraction expert.
 
 Given the following summarized document items:

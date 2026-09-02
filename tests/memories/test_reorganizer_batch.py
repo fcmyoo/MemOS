@@ -173,3 +173,37 @@ class TestReorganizerBatch:
         # 断言 _partition 未被调用（因为候选数不足 min_group_size）
         # 我们通过日志或执行路径验证，这里简单验证 add_node 没被调用
         assert not graph_store.add_node.called
+
+
+class TestL2PolicyInduction:
+    """P1 L2 质化：_summarize_cluster 的 gain 门槛（four-layer-gap-assessment.md 3.1）"""
+
+    def _make_nodes(self, n: int) -> list[GraphDBNode]:
+        return [GraphDBNode(**make_fake_node(f"node_{i}")) for i in range(n)]
+
+    def test_below_min_evidence_skips_llm_and_l2(self, mock_components):
+        """聚类内有效节点数 < MIN_POLICY_EVIDENCE(3) 时，不调用 LLM，也不产生 L2 节点"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        cluster_nodes = self._make_nodes(2)
+        result = reorganizer._summarize_cluster(cluster_nodes, "LongTermMemory")
+
+        assert result is None
+        assert not llm.generate.called
+
+    def test_no_policy_response_skips_l2(self, mock_components):
+        """LLM 判定 no_policy=true 时，不产生 L2 节点（即便节点数达标）"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        llm.generate.return_value = (
+            '{"no_policy": true, "reason": "这些事件彼此无关，无法归纳出可复用规则"}'
+        )
+
+        cluster_nodes = self._make_nodes(3)
+        result = reorganizer._summarize_cluster(cluster_nodes, "LongTermMemory")
+
+        assert result is None
+        assert llm.generate.called
+        assert not embedder.embed.called
