@@ -1594,6 +1594,7 @@ class Neo4jGraphDB(BaseGraphDB):
         - Plus: the child of any parent node that has exactly one child.
         """
         user_name = kwargs.get("user_name") if kwargs.get("user_name") else self.config.user_name
+        max_candidates = kwargs.get("max_candidates") or 40
         where_clause = """
                 WHERE n.memory_type = $scope
                   AND n.status = 'activated'
@@ -1610,10 +1611,11 @@ class Neo4jGraphDB(BaseGraphDB):
             {where_clause}
             RETURN n.id AS id, n AS node
             ORDER BY n.created_at ASC
+            LIMIT $max_candidates
             """
 
         with self.driver.session(database=self.db_name) as session:
-            results = session.run(query, params)
+            results = session.run(query, {**params, "max_candidates": max_candidates})
             return [
                 self._parse_node({"id": record["id"], **dict(record["node"])}) for record in results
             ]

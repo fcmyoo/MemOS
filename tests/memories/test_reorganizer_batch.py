@@ -66,20 +66,18 @@ class TestReorganizerBatch:
 
     @patch("memos.memories.textual.tree_text_memory.organize.reorganizer.GraphStructureReorganizer._partition")
     def test_truncate_candidates_when_exceeds_max(self, mock_partition, mock_components):
-        """测试候选数 > max_candidates 时截断生效"""
+        """LIMIT 已下推 SQL 层：断言调用带 max_candidates 且 mock 返回已截断结果"""
         graph_store, llm, embedder = mock_components
         reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
 
-        # Mock 返回 500 个候选节点
-        fake_nodes = [make_fake_node(f"node_{i}") for i in range(500)]
+        # Mock 模拟 SQL 层已按 LIMIT 200 截断
+        fake_nodes = [make_fake_node(f"node_{i}") for i in range(200)]
         graph_store.get_structure_optimization_candidates.return_value = fake_nodes
         graph_store.node_not_exist.return_value = False
         graph_store.get_memory_count.return_value = 500
 
-        # Mock _partition 返回空，避免后续处理
         mock_partition.return_value = []
 
-        # 调用 optimize_structure，max_candidates=200
         reorganizer.optimize_structure(
             scope="LongTermMemory",
             min_group_size=20,
@@ -88,18 +86,19 @@ class TestReorganizerBatch:
             user_name=None,
         )
 
-        # 断言 _partition 收到的节点数 <= 200
+        # 断言查询层收到 max_candidates 参数（SQL LIMIT）
+        call_kwargs = graph_store.get_structure_optimization_candidates.call_args
+        assert call_kwargs.kwargs.get("max_candidates") == 200
         assert mock_partition.called
         nodes_passed_to_partition = mock_partition.call_args[0][0]
         assert len(nodes_passed_to_partition) == 200
 
     @patch("memos.memories.textual.tree_text_memory.organize.reorganizer.GraphStructureReorganizer._partition")
     def test_no_truncate_when_below_max(self, mock_partition, mock_components):
-        """测试候选数 <= max_candidates 时不截断"""
+        """测试候选数 <= max_candidates 时全量进入分区"""
         graph_store, llm, embedder = mock_components
         reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
 
-        # Mock 返回 50 个候选节点
         fake_nodes = [make_fake_node(f"node_{i}") for i in range(50)]
         graph_store.get_structure_optimization_candidates.return_value = fake_nodes
         graph_store.node_not_exist.return_value = False
@@ -115,19 +114,18 @@ class TestReorganizerBatch:
             user_name=None,
         )
 
-        # 断言 _partition 收到的节点数 = 50（全量）
         assert mock_partition.called
         nodes_passed_to_partition = mock_partition.call_args[0][0]
         assert len(nodes_passed_to_partition) == 50
 
     @patch("memos.memories.textual.tree_text_memory.organize.reorganizer.GraphStructureReorganizer._partition")
     def test_truncate_takes_oldest_nodes(self, mock_partition, mock_components):
-        """测试截断取的是最旧的节点（配合 ORDER BY created_at ASC）"""
+        """测试 LIMIT 下推：查询按 created_at ASC + max_candidates 参数"""
         graph_store, llm, embedder = mock_components
         reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
 
-        # Mock 返回 300 个节点，ID 递增（模拟按 created_at ASC 排序）
-        fake_nodes = [make_fake_node(f"node_{i:04d}") for i in range(300)]
+        # Mock 返回 100 个节点（模拟 SQL 层已按 created_at ASC + LIMIT 100 截断）
+        fake_nodes = [make_fake_node(f"node_{i:04d}") for i in range(100)]
         graph_store.get_structure_optimization_candidates.return_value = fake_nodes
         graph_store.node_not_exist.return_value = False
         graph_store.get_memory_count.return_value = 300
@@ -142,7 +140,9 @@ class TestReorganizerBatch:
             user_name=None,
         )
 
-        # 断言 _partition 收到的是前 100 个节点（node_0000 ~ node_0099 的确定性 UUID）
+        # 断言查询层收到 LIMIT 参数，且 _partition 收到全部 100 个（顺序保持）
+        call_kwargs = graph_store.get_structure_optimization_candidates.call_args
+        assert call_kwargs.kwargs.get("max_candidates") == 100
         nodes_passed = mock_partition.call_args[0][0]
         assert len(nodes_passed) == 100
         expected_first = str(uuid.uuid5(uuid.NAMESPACE_URL, "test://node_0000"))

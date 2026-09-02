@@ -129,7 +129,13 @@ class GraphStructureReorganizer:
         optimize_structure 的候选查询按 user_name 过滤（该属性存 user_id），
         调度路径不传用户会回落到 config 默认值（不在库中）→ 永远 0 候选。
         """
-        for user_name in self._list_active_user_names():
+        users = self._list_active_user_names()
+        # WARNING 级：生产日志仅 WARNING 可见（log.py:33），这是调度唯一可观察点
+        logger.warning(
+            "[Reorganizer] _optimize_all_users scope=%s users=%s optimizing=%s",
+            scope, users, dict(self._is_optimizing),
+        )
+        for user_name in users:
             self.optimize_structure(scope=scope, user_name=user_name, **kwargs)
 
     def wait_until_current_task_done(self):
@@ -182,14 +188,17 @@ class GraphStructureReorganizer:
         schedule.every(100).seconds.do(self._optimize_all_users, scope="LongTermMemory")
         schedule.every(100).seconds.do(self._optimize_all_users, scope="UserMemory")
 
-        logger.info("Structure optimizer schedule started.")
+        # WARNING 级：生产环境日志级别为 WARNING（log.py:33），INFO 全被吞——
+        # 调度线程存活与否只能靠这条日志观察，务必保持 WARNING 及以上。
+        logger.warning("[Reorganizer] Structure optimizer schedule started.")
+
         while not getattr(self, "_stop_scheduler", False):
             schedule.run_pending()  # Drive schedule tasks (without this, registered tasks never execute)
             if any(self._is_optimizing.values()):
                 time.sleep(1)
                 continue
             if self._reorganize_needed:
-                logger.info("[Reorganizer] Triggering optimize_structure due to new nodes.")
+                logger.warning("[Reorganizer] Triggering optimize_structure due to new nodes.")
                 self._optimize_all_users(scope="LongTermMemory")
                 self._optimize_all_users(scope="UserMemory")
                 self._reorganize_needed = False
@@ -283,21 +292,22 @@ class GraphStructureReorganizer:
             if _check_deadline("[GraphStructureReorganize] Before loading candidates"):
                 return
             raw_nodes = self.graph_store.get_structure_optimization_candidates(
-                scope, user_name=user_name
+                scope, user_name=user_name, max_candidates=max_candidates
             )
-            # 分批消化：大库积压数万孤立候选时，一次全量聚类必然超过
-            # max_duration_sec 看门狗（实测 55713 个被静默取消）。每轮只取
-            # 最旧的 max_candidates 个，多轮调度逐步消化积压。
-            # 查询已按 created_at ASC 排序，这里直接取前 max_candidates 即最旧的。
-            if len(raw_nodes) > max_candidates:
-                raw_nodes = raw_nodes[:max_candidates]  # 取最旧的批次
+            # 分批消化：LIMIT 已下推 Neo4j（SQL 截断），Python 内存永不超载——
+            # 此前 Python 侧全量加载 55713 候选（含 embedding）直接 OOM 杀 worker。
             nodes = [GraphDBNode(**n) for n in raw_nodes]
 
+            # WARNING 级关键路径（生产 INFO 被吞，见 log.py:33）
+            logger.warning(
+                "[Reorganize] user=%s scope=%s candidates=%s -> using=%s",
+                user_name, scope, len(raw_nodes), len(nodes),
+            )
             if not nodes:
-                logger.info("[GraphStructureReorganize] No nodes to optimize. Skipping.")
+                logger.warning("[GraphStructureReorganize] No nodes to optimize. Skipping.")
                 return
             if len(nodes) < min_group_size:
-                logger.info(
+                logger.warning(
                     f"[GraphStructureReorganize] Only {len(nodes)} candidate nodes found. Not enough to reorganize. Skipping."
                 )
                 return
