@@ -243,3 +243,82 @@ def turns_complete(
 ) -> dict:
     """轮次完成（简化——无操作）。"""
     return {}
+
+
+class SkillEvidenceRequest(BaseModel):
+    world_model_id: str = Field(..., description="L3 world model 节点 ID")
+    note: str = Field(..., description="正向反馈说明（用户确认该规律有效/已执行成功）")
+
+
+@router.post("/skill/evidence")
+def skill_evidence_add(
+    req: SkillEvidenceRequest,
+    current_user: AuthContext = Depends(get_current_user),
+) -> dict:
+    """为 L3 world model 添加正向 evidence 反馈（P3 Skill 机制，four-layer-gap-assessment.md 3.3）。
+
+    evidence 语义：用户显式确认"这条 L3 规律有效/我已按此执行成功"，作为后续
+    Skill 归纳的前置证据（只有 evidence 达标的 L3 才会被提炼为可执行 Skill）。
+
+    行为：
+    1. 按 id 查 L3 节点（复用 memory_get 的 owner 校验逻辑），校验 type=world_model + memory_layer=L3
+    2. skill_evidence_count += 1（int，默认 0）
+    3. skill_evidence_log 追加 {at: ISO timestamp, note: str}（JSON 字符串列表）
+    4. 返回 {world_model_id, skill_evidence_count}
+
+    鉴权：API key（current_user 绑定的用户），只能为自己的 L3 节点添加 evidence。
+    """
+    from datetime import datetime, timezone
+    import json as _json
+
+    from memos.api.routers import me_router, server_router
+
+    user_name = current_user.get("user_name") or "default"
+    svc = me_router._services()
+    user = svc.user_manager.get_user_by_name(user_name)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="user_inactive")
+
+    # 按 id 查节点（owner 校验：传 user.user_id 作为 user_name 参数）
+    node = server_router.naive_mem_cube.text_mem.graph_store.get_node(
+        req.world_model_id, include_embedding=False, user_name=user.user_id
+    )
+    if node is None:
+        raise HTTPException(status_code=404, detail="world_model_not_found")
+
+    meta = node.get("metadata") or {}
+    # 校验 type=world_model + memory_layer=L3
+    if meta.get("type") != "world_model" or meta.get("memory_layer") != "L3":
+        raise HTTPException(
+            status_code=422,
+            detail="not_world_model: evidence can only be added to L3 world_model nodes",
+        )
+
+    # 读取现有 evidence
+    evidence_count = meta.get("skill_evidence_count", 0)
+    evidence_log_raw = meta.get("skill_evidence_log", "[]")
+    try:
+        evidence_log = _json.loads(evidence_log_raw) if isinstance(evidence_log_raw, str) else evidence_log_raw
+    except (_json.JSONDecodeError, TypeError):
+        evidence_log = []
+
+    # 追加新 evidence
+    evidence_count += 1
+    evidence_log.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "note": req.note,
+    })
+
+    # 更新节点
+    update_data = {
+        "skill_evidence_count": evidence_count,
+        "skill_evidence_log": _json.dumps(evidence_log, ensure_ascii=False),
+    }
+    server_router.naive_mem_cube.text_mem.graph_store.update_node(
+        req.world_model_id, update_data, user_name=user.user_id
+    )
+
+    return {
+        "world_model_id": req.world_model_id,
+        "skill_evidence_count": evidence_count,
+    }

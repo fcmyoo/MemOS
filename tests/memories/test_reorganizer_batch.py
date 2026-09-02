@@ -353,3 +353,107 @@ class TestWorldModelInduction:
         assert graph_store.update_node.call_count == len(all_policy_nodes)
         updated_ids = {call.args[0] for call in graph_store.update_node.call_args_list}
         assert updated_ids == {n.id for n in all_policy_nodes}
+
+
+class TestSkillInduction:
+    """测试 induce_skills 的 P3 Skill 归纳（four-layer-gap-assessment.md 3.3）"""
+
+    def _make_world_node(self, node_id: str, skill_evidence_count: int = 2) -> GraphDBNode:
+        """构造 evidence 达标的 L3 world model 节点（type=world_model, memory_layer=L3），
+        供 Skill 归纳消费。"""
+        data = make_fake_node(node_id)
+        data["metadata"]["type"] = "world_model"
+        data["metadata"]["memory_layer"] = "L3"
+        data["metadata"]["key"] = f"world_key_{node_id}"
+        data["metadata"]["skill_evidence_count"] = skill_evidence_count
+        return GraphDBNode(**data)
+
+    def test_below_min_evidence_skips_llm(self, mock_components):
+        """evidence 不达标的 L3 不会被 _fetch_evidence_qualified_l3 拉取，
+        因而不调用 LLM，也不标记消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        with patch.object(reorganizer, "_fetch_evidence_qualified_l3", return_value=[]):
+            reorganizer.induce_skills(user_name="test_user")
+
+        assert not llm.generate.called
+        assert not graph_store.update_node.called
+
+    def test_no_skill_response_marks_consumed(self, mock_components):
+        """LLM 判定 no_skill=true 时不产出 Skill，但来源 L3 仍标记 skill_induced=True"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        world_node = self._make_world_node("world_0")
+        llm.generate.return_value = (
+            '{"no_skill": true, "reason": "该 world model 缺乏明确可执行步骤"}'
+        )
+
+        with patch.object(
+            reorganizer, "_fetch_evidence_qualified_l3", return_value=[world_node]
+        ):
+            reorganizer.induce_skills(user_name="test_user")
+
+        assert llm.generate.called
+        assert not graph_store.add_node.called
+        assert graph_store.update_node.call_count == 1
+        call = graph_store.update_node.call_args_list[0]
+        assert call.args[0] == world_node.id
+        assert call.args[1] == {"skill_induced": True}
+
+    def test_low_gain_skips_skill(self, mock_components):
+        """gain_self_eval < MIN_SKILL_GAIN 时丢弃归纳结果，不产出 Skill，但仍标记消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        world_node = self._make_world_node("world_0")
+        llm.generate.return_value = (
+            '{"skill_key": "k", "skill_value": "v", "summary": "s", "gain_self_eval": 0.1}'
+        )
+
+        with patch.object(
+            reorganizer, "_fetch_evidence_qualified_l3", return_value=[world_node]
+        ):
+            reorganizer.induce_skills(user_name="test_user")
+
+        assert llm.generate.called
+        assert not graph_store.add_node.called
+        assert graph_store.update_node.call_count == 1
+        call = graph_store.update_node.call_args_list[0]
+        assert call.args[0] == world_node.id
+        assert call.args[1] == {"skill_induced": True}
+
+    def test_successful_skill_creates_trial_node(self, mock_components):
+        """gain 达标且判定可技能化时，创建 trial 态 Skill 节点并挂 PARENT 边，
+        同时标记来源 L3 已消费"""
+        graph_store, llm, embedder = mock_components
+        reorganizer = GraphStructureReorganizer(graph_store, llm, embedder, is_reorganize=False)
+
+        world_node = self._make_world_node("world_0")
+        llm.generate.return_value = (
+            '{"skill_key": "review_before_push", '
+            '"skill_value": "推送前先跑一遍代码评审", '
+            '"trigger": "git push 前", '
+            '"tags": ["review"], "summary": "多次 evidence 验证有效", '
+            '"gain_self_eval": 0.8}'
+        )
+        embedder.embed.return_value = [[0.2] * 128]
+        graph_store.edge_exists.return_value = False
+
+        with patch.object(
+            reorganizer, "_fetch_evidence_qualified_l3", return_value=[world_node]
+        ):
+            reorganizer.induce_skills(user_name="test_user")
+
+        assert graph_store.add_node.called
+        added_metadata = graph_store.add_node.call_args[0][2]
+        assert added_metadata["memory_layer"] == "Skill"
+        assert added_metadata["type"] == "skill"
+        assert added_metadata["skill_status"] == "trial"
+
+        assert graph_store.add_edge.call_count == 1
+        assert graph_store.update_node.call_count == 1
+        call = graph_store.update_node.call_args_list[0]
+        assert call.args[0] == world_node.id
+        assert call.args[1] == {"skill_induced": True}

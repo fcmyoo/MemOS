@@ -101,6 +101,47 @@ WORLD_MODEL_PROMPT = """你是一名用户画像/世界模型归纳专家（worl
 {{"no_world_model": true, "reason": <string，说明原因>}}
 """
 
+SKILL_INDUCTION_PROMPT = """你是一名可执行技能归纳专家（skill induction），负责从已被用户正向验证的 L3 world model（稳定规律/用户画像）中提炼**可操作的技能**（具备明确执行步骤）。
+
+以下是一条经过正向 evidence 验证的 L3 world model：
+
+**World Model**：
+- world_key: {world_key}
+- world_value: {world_value}
+- summary: {summary}
+
+**正向 Evidence**（用户已确认该规律有效/按此执行成功）：
+{evidence_items}
+
+任务要求：
+1. 只输出**可操作/可执行的技能**（skill），必须包含明确的执行步骤，而不是描述性的规律或画像陈述。
+   - 形如"当场景 X 出现时，执行以下步骤：1) ... 2) ... 3) ..."
+   - 或"为达成目标 Y，采取这些操作：步骤 A → 步骤 B → 步骤 C"
+2. 技能必须从 world model 的稳定规律中提炼，且有足够 evidence 支撑（evidence 条数 ≥ 2）。
+3. 明确技能的触发场景（何时使用该技能）、执行步骤（具体操作序列）、预期收益（为何这个技能有效）。
+4. 如实自评该技能的置信度/收益（gain_self_eval，0.0-1.0）：
+   - evidence 越多、越一致、技能步骤越可执行 → 越接近 1.0
+   - evidence 单薄、技能含糊、或 world model 本身不够可操作 → 越接近 0.0
+5. 如果该 world model 无法转化为可执行技能（例如只是描述性规律、缺乏明确步骤、或 evidence 不足以支撑技能化），**不要勉强编造技能**，直接输出 {{"no_skill": true, "reason": "<说明无法技能化的原因>"}}。
+
+语言规则：
+- 全部输出使用中文（输入是中文）。
+
+请返回合法 JSON（能归纳出技能时）：
+{{
+  "skill_key": <string，技能的简短名称，如"调试卡住时的日志驱动排查流程">,
+  "skill_value": <string，可执行的技能描述本身，必须包含明确的步骤化操作序列（步骤 1/2/3...或操作 A→B→C），不得是描述性规律>,
+  "trigger": <string，何种场景下触发此技能（触发条件/适用场景）>,
+  "evidence_count": <int，支持该技能的 evidence 条数（本次输入的 evidence 实际条数）>,
+  "gain_self_eval": <float，0.0-1.0，对该技能可信度/收益的自评>,
+  "tags": <字符串数组，技能相关的主题关键词>,
+  "summary": <string，该技能的执行效果与 evidence 验证概要，说明这些 evidence 如何共同支撑该技能的有效性>
+}}
+
+无法归纳技能时，只返回：
+{{"no_skill": true, "reason": <string，说明原因>}}
+"""
+
 DOC_REORGANIZE_PROMPT = """You are a document summarization and knowledge extraction expert.
 
 Given the following summarized document items:

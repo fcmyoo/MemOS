@@ -24,6 +24,7 @@ from memos.memories.textual.tree_text_memory.organize.relation_reason_detector i
 from memos.templates.tree_reorganize_prompts import (
     LOCAL_SUBCLUSTER_PROMPT,
     POLICY_INDUCTION_PROMPT,
+    SKILL_INDUCTION_PROMPT,
     WORLD_MODEL_PROMPT,
 )
 
@@ -98,6 +99,13 @@ class GraphStructureReorganizer:
     MIN_WORLD_EVIDENCE = 3
     MIN_WORLD_GAIN = 0.3
 
+    # P3 Skill evidence/trial 机制门槛（four-layer-gap-assessment.md 3.3，对齐 memmy
+    # skill-pipeline 语义）：
+    # - MIN_SKILL_EVIDENCE：归纳 Skill 所需的最少正向 evidence 条数，低于此不调用 LLM
+    # - MIN_SKILL_GAIN：LLM 自评 gain_self_eval 门槛，低于此丢弃归纳结果（不生成 Skill）
+    MIN_SKILL_EVIDENCE = 2
+    MIN_SKILL_GAIN = 0.3
+
     def __init__(
         self, graph_store: Neo4jGraphDB, llm: BaseLLM, embedder: OllamaEmbedder, is_reorganize: bool
     ):
@@ -161,6 +169,9 @@ class GraphStructureReorganizer:
             # 事件驱动路径（新节点触发）共同的调用入口，接在这里天然覆盖两条触发路径，
             # 无需在别处重复接线（four-layer-gap-assessment.md 3.2）。
             self.induce_world_models(user_name=user_name)
+            # P3 Skill：induce_world_models 产出新 L3 后立即消费归纳 Skill（evidence 驱动）。
+            # 接在这里天然覆盖定时与事件驱动两条触发路径（four-layer-gap-assessment.md 3.3）。
+            self.induce_skills(user_name=user_name)
 
     def wait_until_current_task_done(self):
         """
@@ -917,6 +928,194 @@ class GraphStructureReorganizer:
             ),
         )
         return world_node
+
+    def _fetch_evidence_qualified_l3(
+        self, user_name: str | None = None, limit: int = 20
+    ) -> list[GraphDBNode]:
+        """查询该用户 evidence 达标且尚未被 Skill 归纳消费的 L3 world model
+        （P3 Skill 机制，four-layer-gap-assessment.md 3.3）。
+
+        消费标记：skill_induced 布尔属性挂在 L3 节点上，默认未设置（NULL）视为未消费。
+        evidence 门槛：skill_evidence_count >= MIN_SKILL_EVIDENCE（默认 2），只有正向反馈
+        达标的 L3 才会被拉取归纳 Skill（对齐 memmy skill-pipeline 的 minSupport 语义）。
+        LIMIT 20：复用 P1/P2 分批思路，防止一次性拉取过多节点 OOM。
+        """
+        where_clause = (
+            "WHERE n.type = 'world_model' AND n.memory_layer = 'L3' AND n.status = 'activated' "
+            f"AND n.skill_evidence_count >= {self.MIN_SKILL_EVIDENCE} "
+            "AND (n.skill_induced IS NULL OR n.skill_induced = false)"
+        )
+        params: dict = {"limit": limit}
+        if user_name:
+            where_clause += " AND n.user_name = $user_name"
+            params["user_name"] = user_name
+
+        query = f"""
+            MATCH (n:Memory)
+            {where_clause}
+            RETURN n.id AS id, n AS node
+            ORDER BY n.skill_evidence_count DESC, n.created_at ASC
+            LIMIT $limit
+        """
+        try:
+            with self.graph_store.driver.session(database=self.graph_store.db_name) as session:
+                rows = session.run(query, params).data()
+            raw_nodes = [
+                self.graph_store._parse_node({"id": r["id"], **dict(r["node"])}) for r in rows
+            ]
+            return [GraphDBNode(**n) for n in raw_nodes]
+        except Exception:
+            logger.warning(
+                "[Reorganizer] fetch evidence-qualified L3 failed for user=%s", user_name,
+                exc_info=True,
+            )
+            return []
+
+    def induce_skills(self, user_name: str | None = None) -> None:
+        """P3 Skill 归纳：消费该用户 evidence 达标且未被归纳过的 L3 world model，
+        按 evidence 验证提炼可执行技能（对齐 memmy skill-pipeline 的 evidence 驱动
+        + trial 机制，four-layer-gap-assessment.md 3.3）。
+
+        L3 消费标记机制：skill_induced 布尔属性默认未设置=未消费。无论 evidence 是否
+        达标、LLM 是否判定 no_skill、gain 是否达标，**本批拉取到的 L3（不只是产出
+        Skill 的那部分）在处理完后统一标记 skill_induced=true**——不可技能化的 L3
+        不应无限重试拖慢调度，保持孤立即可，新 evidence 积累后会随后续新产出的 L3
+        一起在下一批被重新拉取。
+
+        Skill 草稿态（trial）：产出的 Skill 节点 skill_status="trial"（草稿），
+        memmy 语义是"需实际成功使用 N 次后转 activated"——本阶段先落 trial 态，
+        后续接实际执行反馈后转正（由 Hermes 工具执行结果反馈或用户确认驱动）。
+        """
+        l3_nodes = self._fetch_evidence_qualified_l3(user_name=user_name)
+        if not l3_nodes:
+            logger.warning(
+                "[Reorganizer] induce_skills user=%s: no evidence-qualified L3 world models.",
+                user_name,
+            )
+            return
+
+        # WARNING 级：生产日志仅 WARNING 可见（log.py:33），关键数字必须在此可观察
+        logger.warning(
+            "[Reorganizer] induce_skills user=%s input_l3=%s",
+            user_name, len(l3_nodes),
+        )
+
+        skill_count = 0
+        skip_no_skill_or_low_gain = 0
+        for l3_node in l3_nodes:
+            skill_node = self._summarize_skill(l3_node)
+            if skill_node is None:
+                skip_no_skill_or_low_gain += 1
+                continue
+
+            self._create_parent_node(skill_node, user_name=user_name)
+            # Link: Skill → L3（sources 记录，PARENT 边表示层级关系）
+            self._link_cluster_nodes(skill_node, [l3_node], user_name=user_name)
+            skill_count += 1
+
+        # 标记本批 L3 已消费（无论是否产出 Skill）
+        for node in l3_nodes:
+            self.graph_store.update_node(node.id, {"skill_induced": True}, user_name=user_name)
+
+        logger.warning(
+            "[Reorganizer] induce_skills done user=%s input_l3=%s output_skill=%s "
+            "skip_no_skill_or_low_gain=%s",
+            user_name, len(l3_nodes), skill_count, skip_no_skill_or_low_gain,
+        )
+
+    def _summarize_skill(self, l3_node: GraphDBNode) -> GraphDBNode | None:
+        """从 evidence 验证的 L3 world model 归纳可执行 Skill（对齐 memmy skill-pipeline
+        语义，four-layer-gap-assessment.md 3.3）。
+
+        质量门槛（未通过则返回 None，不生成 Skill；调用方 induce_skills 仍会把
+        这个 L3 标记为已消费，不因归纳失败而无限重试）：
+        - LLM 判定 no_skill=true：该 world model 无法转化为可执行技能（缺乏明确步骤）
+        - gain_self_eval < MIN_SKILL_GAIN：技能的置信度/收益不足
+        """
+        if not l3_node:
+            raise ValueError("L3 node cannot be empty.")
+
+        meta = l3_node.metadata
+        world_key = meta.key or ""
+        world_value = l3_node.memory or ""
+        world_summary = meta.background or ""
+
+        # 读取 evidence 日志
+        evidence_log_raw = getattr(meta, "skill_evidence_log", "[]")
+        try:
+            evidence_log = json.loads(evidence_log_raw) if isinstance(evidence_log_raw, str) else evidence_log_raw
+        except (json.JSONDecodeError, TypeError):
+            evidence_log = []
+
+        evidence_items_text = "\n".join(
+            [f"{i+1}. [{item.get('at', '')}] {item.get('note', '')}" for i, item in enumerate(evidence_log)]
+        )
+
+        # 构造 prompt（替换占位符）
+        prompt = SKILL_INDUCTION_PROMPT.replace("{world_key}", world_key)
+        prompt = prompt.replace("{world_value}", world_value)
+        prompt = prompt.replace("{summary}", world_summary)
+        prompt = prompt.replace("{evidence_items}", evidence_items_text)
+
+        messages = [{"role": "user", "content": prompt}]
+        response_text = self.llm.generate(messages)
+        response_json = self._parse_json_result(response_text)
+
+        if not response_json or response_json.get("no_skill"):
+            logger.warning(
+                "[Reorganizer] LLM reported no_skill for L3 (id=%s): %s",
+                l3_node.id,
+                response_json.get("reason", "") if response_json else "parse_failed",
+            )
+            return None
+
+        try:
+            gain_self_eval = float(response_json.get("gain_self_eval", 0.0))
+        except (TypeError, ValueError):
+            gain_self_eval = 0.0
+
+        if gain_self_eval < self.MIN_SKILL_GAIN:
+            logger.warning(
+                "[Reorganizer] gain_self_eval=%.3f < MIN_SKILL_GAIN=%s, skip Skill induction.",
+                gain_self_eval, self.MIN_SKILL_GAIN,
+            )
+            return None
+
+        skill_key = str(response_json.get("skill_key", "")).strip()
+        skill_value = str(response_json.get("skill_value", "")).strip()
+        skill_trigger = str(response_json.get("trigger", "")).strip()
+        skill_tags = response_json.get("tags", [])
+        skill_summary = str(response_json.get("summary", "")).strip()
+        evidence_count = int(response_json.get("evidence_count", len(evidence_log)))
+
+        embedding = self.embedder.embed([skill_value])[0]
+
+        skill_node = GraphDBNode(
+            memory=skill_value,
+            metadata=TreeNodeTextualMemoryMetadata(
+                user_id=None,
+                session_id=None,
+                memory_type=l3_node.metadata.memory_type,
+                status="activated",
+                key=skill_key,
+                tags=skill_tags,
+                embedding=embedding,
+                usage=[],
+                # sources：来源 L3 world model 的 id（单个来源，复用 build_summary_parent_node）
+                sources=build_summary_parent_node([l3_node]),
+                background=skill_summary,
+                confidence=gain_self_eval,
+                type="skill",
+                memory_layer="Skill",
+                # P3 Skill trial 机制（对齐 memmy skill-pipeline 的 candidateTrials 语义）：
+                # 产出的 Skill 初始为 "trial" 草稿态，需实际成功使用 N 次后转 "activated"。
+                # 本阶段先落 trial 态，后续接工具执行结果/用户确认反馈后转正。
+                skill_status="trial",
+                skill_trigger=skill_trigger,
+                skill_evidence_count=evidence_count,
+            ),
+        )
+        return skill_node
 
     def _parse_json_result(self, response_text):
         try:
